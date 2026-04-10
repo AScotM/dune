@@ -8,8 +8,10 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import socket
+import sqlite3
 import struct
 import sys
 import threading
@@ -24,7 +26,18 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 
 APP_NAME = "cgnet-anomaly"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
+
+RATE_METRICS = (
+    "rx_bps",
+    "tx_bps",
+    "rx_pps",
+    "tx_pps",
+    "rx_errs_ps",
+    "tx_errs_ps",
+    "rx_drop_ps",
+    "tx_drop_ps",
+)
 
 
 @dataclass(slots=True)
@@ -151,16 +164,7 @@ class InterfaceBaseline:
         )
 
     def as_dict(self) -> Dict[str, BaselineSnapshot]:
-        return {
-            "rx_bps": self.snapshot("rx_bps"),
-            "tx_bps": self.snapshot("tx_bps"),
-            "rx_pps": self.snapshot("rx_pps"),
-            "tx_pps": self.snapshot("tx_pps"),
-            "rx_errs_ps": self.snapshot("rx_errs_ps"),
-            "tx_errs_ps": self.snapshot("tx_errs_ps"),
-            "rx_drop_ps": self.snapshot("rx_drop_ps"),
-            "tx_drop_ps": self.snapshot("tx_drop_ps"),
-        }
+        return {metric: self.snapshot(metric) for metric in RATE_METRICS}
 
 
 @dataclass(slots=True)
@@ -233,6 +237,14 @@ class MonitorConfig:
     bind_host: str = "127.0.0.1"
     bind_port: int = 8080
     event_log_path: Optional[str] = None
+    sqlite_path: Optional[str] = None
+    console_sort: str = "iface"
+    console_filter_status: str = "all"
+    replay_path: Optional[str] = None
+    replay_speed: float = 1.0
+    selftest_mode: bool = False
+    selftest_interfaces: int = 3
+    selftest_seed: int = 1337
     policy: ThresholdPolicy = field(default_factory=ThresholdPolicy)
 
 
@@ -255,7 +267,12 @@ class TextReader:
             return None
 
 
-class LinuxNetReader:
+class SampleProvider:
+    def collect(self, selected: Optional[Iterable[str]] = None) -> Dict[str, InterfaceSample]:
+        raise NotImplementedError
+
+
+class LinuxNetReader(SampleProvider):
     def __init__(self) -> None:
         self.sys_net = Path("/sys/class/net")
         self.proc_net_dev = Path("/proc/net/dev")
@@ -337,7 +354,7 @@ class LinuxNetReader:
             return None
 
     def get_identity(self, iface: str, ipv6_map: Dict[str, List[str]]) -> InterfaceIdentity:
-        base = self.sys_net / iface
+        base = Path("/sys/class/net") / iface
         return InterfaceIdentity(
             name=iface,
             operstate=TextReader.read_text(base / "operstate") or "unknown",
@@ -364,6 +381,138 @@ class LinuxNetReader:
                 timestamp_mono=now_mono,
                 identity=identity,
                 counters=counters.get(iface, InterfaceCounters()),
+            )
+        return result
+
+
+class ReplayReader(SampleProvider):
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.frames = self._load_frames()
+        self.index = 0
+        self.started_wall = time.time()
+        self.started_mono = time.monotonic()
+        self.frame_count = len(self.frames)
+
+    def _load_frames(self) -> List[Dict[str, Any]]:
+        if not self.path.exists():
+            raise FileNotFoundError(f"replay file not found: {self.path}")
+        text = self.path.read_text(encoding="utf-8")
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError("replay file must contain a JSON array")
+        return data
+
+    def collect(self, selected: Optional[Iterable[str]] = None) -> Dict[str, InterfaceSample]:
+        if not self.frames:
+            return {}
+        frame = self.frames[self.index % len(self.frames)]
+        self.index += 1
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        names_filter = set(selected) if selected is not None else None
+        result: Dict[str, InterfaceSample] = {}
+        interfaces = frame.get("interfaces", {})
+        if not isinstance(interfaces, dict):
+            return result
+        for iface, payload in interfaces.items():
+            if names_filter is not None and iface not in names_filter:
+                continue
+            identity_data = payload.get("identity", {}) if isinstance(payload, dict) else {}
+            counters_data = payload.get("counters", {}) if isinstance(payload, dict) else {}
+            identity = InterfaceIdentity(
+                name=iface,
+                operstate=str(identity_data.get("operstate", "up")),
+                carrier=coerce_int(identity_data.get("carrier")),
+                mtu=coerce_int(identity_data.get("mtu")),
+                speed=coerce_int(identity_data.get("speed")),
+                duplex=coerce_str(identity_data.get("duplex")),
+                mac=coerce_str(identity_data.get("mac")),
+                ipv4=coerce_str(identity_data.get("ipv4")),
+                ipv6=[str(x) for x in identity_data.get("ipv6", [])] if isinstance(identity_data.get("ipv6", []), list) else [],
+            )
+            counters = InterfaceCounters(
+                rx_bytes=coerce_int(counters_data.get("rx_bytes")) or 0,
+                tx_bytes=coerce_int(counters_data.get("tx_bytes")) or 0,
+                rx_packets=coerce_int(counters_data.get("rx_packets")) or 0,
+                tx_packets=coerce_int(counters_data.get("tx_packets")) or 0,
+                rx_errs=coerce_int(counters_data.get("rx_errs")) or 0,
+                tx_errs=coerce_int(counters_data.get("tx_errs")) or 0,
+                rx_drop=coerce_int(counters_data.get("rx_drop")) or 0,
+                tx_drop=coerce_int(counters_data.get("tx_drop")) or 0,
+            )
+            result[iface] = InterfaceSample(
+                timestamp_wall=now_wall,
+                timestamp_mono=now_mono,
+                identity=identity,
+                counters=counters,
+            )
+        return result
+
+
+class SelfTestReader(SampleProvider):
+    def __init__(self, count: int, seed: int) -> None:
+        self.rng = random.Random(seed)
+        self.names = [f"sim{i}" for i in range(1, max(1, count) + 1)]
+        self.counters: Dict[str, InterfaceCounters] = {name: InterfaceCounters() for name in self.names}
+        self.states: Dict[str, str] = {name: "up" for name in self.names}
+
+    def collect(self, selected: Optional[Iterable[str]] = None) -> Dict[str, InterfaceSample]:
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        names = list(selected) if selected is not None else list(self.names)
+        result: Dict[str, InterfaceSample] = {}
+        for iface in names:
+            if iface not in self.counters:
+                continue
+            c = self.counters[iface]
+            burst = self.rng.random()
+            rx_step = self.rng.randint(20_000, 200_000)
+            tx_step = self.rng.randint(10_000, 140_000)
+            if burst > 0.96:
+                rx_step *= self.rng.randint(10, 60)
+                tx_step *= self.rng.randint(10, 50)
+            rx_packets = max(1, rx_step // self.rng.randint(500, 1500))
+            tx_packets = max(1, tx_step // self.rng.randint(500, 1500))
+            c.rx_bytes += rx_step
+            c.tx_bytes += tx_step
+            c.rx_packets += rx_packets
+            c.tx_packets += tx_packets
+            if self.rng.random() > 0.985:
+                c.rx_errs += self.rng.randint(1, 3)
+            if self.rng.random() > 0.987:
+                c.tx_errs += self.rng.randint(1, 3)
+            if self.rng.random() > 0.988:
+                c.rx_drop += self.rng.randint(1, 4)
+            if self.rng.random() > 0.989:
+                c.tx_drop += self.rng.randint(1, 4)
+            if self.rng.random() > 0.994:
+                self.states[iface] = "down" if self.states[iface] == "up" else "up"
+            identity = InterfaceIdentity(
+                name=iface,
+                operstate=self.states[iface],
+                carrier=1 if self.states[iface] == "up" else 0,
+                mtu=1500,
+                speed=1000,
+                duplex="full",
+                mac=f"02:00:00:{self.rng.randint(0,255):02x}:{self.rng.randint(0,255):02x}:{self.rng.randint(0,255):02x}",
+                ipv4=f"10.0.0.{self.rng.randint(2, 250)}",
+                ipv6=[],
+            )
+            result[iface] = InterfaceSample(
+                timestamp_wall=now_wall,
+                timestamp_mono=now_mono,
+                identity=identity,
+                counters=InterfaceCounters(
+                    rx_bytes=c.rx_bytes,
+                    tx_bytes=c.tx_bytes,
+                    rx_packets=c.rx_packets,
+                    tx_packets=c.tx_packets,
+                    rx_errs=c.rx_errs,
+                    tx_errs=c.tx_errs,
+                    rx_drop=c.rx_drop,
+                    tx_drop=c.tx_drop,
+                ),
             )
         return result
 
@@ -399,23 +548,95 @@ class RateCalculator:
 
 
 class EventStore:
-    def __init__(self, path: Optional[str]) -> None:
-        self.path = path
+    def __init__(self, jsonl_path: Optional[str], sqlite_path: Optional[str]) -> None:
+        self.jsonl_path = jsonl_path
+        self.sqlite_path = sqlite_path
         self._lock = threading.RLock()
+        if self.sqlite_path:
+            self._init_sqlite()
+
+    def _init_sqlite(self) -> None:
+        try:
+            parent = Path(self.sqlite_path).expanduser().resolve().parent
+            parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS events (
+                        event_id INTEGER PRIMARY KEY,
+                        ts_wall REAL NOT NULL,
+                        ts_mono REAL NOT NULL,
+                        iface TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        metric TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        value REAL NOT NULL,
+                        baseline_mean REAL NOT NULL,
+                        baseline_stdev REAL NOT NULL,
+                        zscore REAL NOT NULL,
+                        ratio REAL NOT NULL,
+                        tags_json TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_wall ON events(ts_wall)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_iface ON events(iface)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
+                conn.commit()
+        except sqlite3.Error:
+            logging.exception("failed to initialize sqlite store")
 
     def append(self, event: AnomalyEvent) -> None:
-        if not self.path:
+        with self._lock:
+            self._append_jsonl(event)
+            self._append_sqlite(event)
+
+    def _append_jsonl(self, event: AnomalyEvent) -> None:
+        if not self.jsonl_path:
             return
         record = asdict(event)
         line = json.dumps(record, ensure_ascii=False) + "\n"
-        with self._lock:
-            try:
-                parent = Path(self.path).expanduser().resolve().parent
-                parent.mkdir(parents=True, exist_ok=True)
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line)
-            except OSError:
-                logging.exception("failed to append event log")
+        try:
+            parent = Path(self.jsonl_path).expanduser().resolve().parent
+            parent.mkdir(parents=True, exist_ok=True)
+            with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            logging.exception("failed to append jsonl event log")
+
+    def _append_sqlite(self, event: AnomalyEvent) -> None:
+        if not self.sqlite_path:
+            return
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO events (
+                        event_id, ts_wall, ts_mono, iface, severity, category, metric,
+                        message, value, baseline_mean, baseline_stdev, zscore, ratio, tags_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        event.ts_wall,
+                        event.ts_mono,
+                        event.iface,
+                        event.severity,
+                        event.category,
+                        event.metric,
+                        event.message,
+                        event.value,
+                        event.baseline_mean,
+                        event.baseline_stdev,
+                        event.zscore,
+                        event.ratio,
+                        json.dumps(event.tags, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+        except sqlite3.Error:
+            logging.exception("failed to append sqlite event log")
 
 
 class AnomalyEngine:
@@ -774,13 +995,13 @@ class HealthEvaluator:
 
 
 class MonitorState:
-    def __init__(self, config: MonitorConfig) -> None:
+    def __init__(self, config: MonitorConfig, reader: SampleProvider) -> None:
         self.config = config
         self.started_wall = time.time()
         self.started_mono = time.monotonic()
-        self.reader = LinuxNetReader()
+        self.reader = reader
         self.engine = AnomalyEngine(config.policy)
-        self.store = EventStore(config.event_log_path)
+        self.store = EventStore(config.event_log_path, config.sqlite_path)
         self.interfaces: Dict[str, InterfaceState] = {}
         self.global_events: Deque[AnomalyEvent] = deque(maxlen=config.global_event_history)
         self.lock = threading.RLock()
@@ -791,18 +1012,32 @@ class MonitorState:
         self._interface_cache_time: Optional[float] = None
 
     def selected_interfaces(self) -> List[str]:
-        now = time.monotonic()
-        if self._interface_list_cache is not None and self._interface_cache_time is not None:
-            if (now - self._interface_cache_time) < 5.0:
-                names = self._interface_list_cache
-            else:
-                names = self.reader.list_interfaces(force_refresh=True)
-                self._interface_list_cache = names
-                self._interface_cache_time = now
+        if self.config.selftest_mode:
+            names = list(getattr(self.reader, "names", []))
+        elif self.config.replay_path:
+            names = []
+            if hasattr(self.reader, "frames") and getattr(self.reader, "frames"):
+                first_frame = getattr(self.reader, "frames")[0]
+                interfaces = first_frame.get("interfaces", {}) if isinstance(first_frame, dict) else {}
+                if isinstance(interfaces, dict):
+                    names = sorted(interfaces.keys())
         else:
-            names = self.reader.list_interfaces()
-            self._interface_list_cache = names
-            self._interface_cache_time = now
+            now = time.monotonic()
+            linux_reader = self.reader
+            if isinstance(linux_reader, LinuxNetReader):
+                if self._interface_list_cache is not None and self._interface_cache_time is not None:
+                    if (now - self._interface_cache_time) < 5.0:
+                        names = self._interface_list_cache
+                    else:
+                        names = linux_reader.list_interfaces(force_refresh=True)
+                        self._interface_list_cache = names
+                        self._interface_cache_time = now
+                else:
+                    names = linux_reader.list_interfaces()
+                    self._interface_list_cache = names
+                    self._interface_cache_time = now
+            else:
+                names = []
 
         if self.config.include:
             allowed = set(self.config.include)
@@ -826,7 +1061,15 @@ class MonitorState:
                 "events_total": len(self.global_events),
                 "health": status_counts,
                 "last_tick_wall": self.last_tick_wall,
+                "mode": self.mode_name(),
             }
+
+    def mode_name(self) -> str:
+        if self.config.selftest_mode:
+            return "selftest"
+        if self.config.replay_path:
+            return "replay"
+        return "live"
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -842,6 +1085,7 @@ class MonitorState:
                 },
                 "events_total": len(self.global_events),
                 "last_tick_wall": self.last_tick_wall,
+                "mode": self.mode_name(),
             }
 
     def interface_snapshot(self, iface: str, state: InterfaceState) -> Dict[str, Any]:
@@ -906,7 +1150,7 @@ class MonitorState:
 
     def update(self) -> None:
         selected = self.selected_interfaces()
-        samples = self.reader.collect(selected)
+        samples = self.reader.collect(selected if selected else None)
         with self.lock:
             for iface, sample in samples.items():
                 state = self.interfaces.setdefault(
@@ -1124,25 +1368,46 @@ class ConsoleRenderer:
         return f"{value:.2f} pps"
 
     @staticmethod
-    def render(state: MonitorState) -> str:
+    def sort_items(items: List[Tuple[str, InterfaceState]], sort_key: str) -> List[Tuple[str, InterfaceState]]:
+        def key_func(item: Tuple[str, InterfaceState]) -> Tuple[Any, ...]:
+            iface, state = item
+            rates = state.latest_rates or InterfaceRates()
+            health_score = state.health.score
+            if sort_key == "rx":
+                return (-rates.rx_bps, iface)
+            if sort_key == "tx":
+                return (-rates.tx_bps, iface)
+            if sort_key == "events":
+                return (-len(state.events), iface)
+            if sort_key == "health":
+                return (-health_score, iface)
+            return (iface,)
+
+        return sorted(items, key=key_func)
+
+    @staticmethod
+    def render(state: MonitorState, sort_key: str, status_filter: str) -> str:
         with state.lock:
             lines: List[str] = []
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            lines.append(f"{APP_NAME} {APP_VERSION}  time={ts}  cycles={state.cycles}")
+            lines.append(f"{APP_NAME} {APP_VERSION}  time={ts}  cycles={state.cycles}  mode={state.mode_name()}  sort={sort_key}  filter={status_filter}")
             lines.append(
-                f"{'IFACE':<12} {'STATE':<12} {'HEALTH':<10} {'RX':>14} {'TX':>14} {'RX PPS':>12} {'TX PPS':>12} {'EVENTS':>8}"
+                f"{'IFACE':<12} {'STATE':<12} {'HEALTH':<10} {'SCORE':>6} {'RX':>14} {'TX':>14} {'RX PPS':>12} {'TX PPS':>12} {'EVENTS':>8}"
             )
-            lines.append("-" * 106)
-            for iface in sorted(state.interfaces):
-                item = state.interfaces[iface]
+            lines.append("-" * 114)
+            items = ConsoleRenderer.sort_items(list(state.interfaces.items()), sort_key)
+            for iface, item in items:
                 latest = item.latest
                 rates = item.latest_rates
                 if latest is None or rates is None:
+                    continue
+                if status_filter != "all" and item.health.status != status_filter:
                     continue
                 lines.append(
                     f"{iface:<12} "
                     f"{latest.identity.operstate:<12} "
                     f"{item.health.status:<10} "
+                    f"{item.health.score:>6} "
                     f"{ConsoleRenderer.human_bytes_per_second(rates.rx_bps):>14} "
                     f"{ConsoleRenderer.human_bytes_per_second(rates.tx_bps):>14} "
                     f"{ConsoleRenderer.human_pps(rates.rx_pps):>12} "
@@ -1181,6 +1446,30 @@ def load_config_from_file(path: Optional[str]) -> Dict[str, Any]:
     return data
 
 
+def coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
+
+
 def validate_host(value: str) -> str:
     if not value:
         raise ValueError("host must not be empty")
@@ -1205,6 +1494,12 @@ def validate_history(value: int, name: str) -> int:
     return value
 
 
+def validate_choice(value: str, allowed: List[str], name: str) -> str:
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of: {', '.join(allowed)}")
+    return value
+
+
 def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfig:
     policy_data = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
     policy = ThresholdPolicy(
@@ -1225,6 +1520,7 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         cooldown_seconds=float(policy_data.get("cooldown_seconds", args.cooldown_seconds)),
         anomaly_freeze_baseline=bool(policy_data.get("anomaly_freeze_baseline", args.anomaly_freeze_baseline)),
     )
+
     include = data.get("include")
     if include is None:
         include = parse_list(args.include)
@@ -1238,6 +1534,14 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
     global_event_history = validate_history(int(data.get("global_event_history", args.global_event_history)), "global_event_history")
     interface_event_history = validate_history(int(data.get("interface_event_history", args.interface_event_history)), "interface_event_history")
     rate_history = validate_history(int(data.get("rate_history", args.rate_history)), "rate_history")
+    replay_speed = validate_interval(float(data.get("replay_speed", args.replay_speed)), "replay_speed")
+
+    console_sort = validate_choice(str(data.get("console_sort", args.console_sort)), ["iface", "rx", "tx", "events", "health"], "console_sort")
+    console_filter_status = validate_choice(str(data.get("console_filter_status", args.console_filter_status)), ["all", "healthy", "warning", "critical", "unknown"], "console_filter_status")
+
+    selftest_interfaces = int(data.get("selftest_interfaces", args.selftest_interfaces))
+    if selftest_interfaces <= 0:
+        raise ValueError("selftest_interfaces must be greater than 0")
 
     return MonitorConfig(
         interval=interval,
@@ -1249,6 +1553,14 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         bind_host=bind_host,
         bind_port=bind_port,
         event_log_path=data.get("event_log_path", args.event_log_path),
+        sqlite_path=data.get("sqlite_path", args.sqlite_path),
+        console_sort=console_sort,
+        console_filter_status=console_filter_status,
+        replay_path=data.get("replay_path", args.replay_path),
+        replay_speed=replay_speed,
+        selftest_mode=bool(data.get("selftest_mode", args.selftest_mode)),
+        selftest_interfaces=selftest_interfaces,
+        selftest_seed=int(data.get("selftest_seed", args.selftest_seed)),
         policy=policy,
     )
 
@@ -1264,6 +1576,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interface-event-history", type=int, default=256, help="per-interface event history")
     parser.add_argument("--rate-history", type=int, default=256, help="per-interface rate history")
     parser.add_argument("--event-log-path", help="append anomaly events to JSONL file")
+    parser.add_argument("--sqlite-path", help="persist anomaly events to SQLite")
+    parser.add_argument("--console-sort", default="iface", choices=["iface", "rx", "tx", "events", "health"])
+    parser.add_argument("--console-filter-status", default="all", choices=["all", "healthy", "warning", "critical", "unknown"])
+    parser.add_argument("--replay-path", help="replay samples from JSON file")
+    parser.add_argument("--replay-speed", type=float, default=1.0, help="multiply replay speed")
+    parser.add_argument("--selftest-mode", action="store_true")
+    parser.add_argument("--selftest-interfaces", type=int, default=3)
+    parser.add_argument("--selftest-seed", type=int, default=1337)
     parser.add_argument("--config", help="JSON config file")
     parser.add_argument("--quiet", action="store_true", help="disable console rendering")
     parser.add_argument("--console-interval", type=float, default=2.0, help="console refresh interval")
@@ -1293,11 +1613,11 @@ def clear_screen() -> None:
         sys.stdout.flush()
 
 
-def run_console_loop(state: MonitorState, stop: threading.Event, interval: float) -> None:
+def run_console_loop(state: MonitorState, stop: threading.Event, interval: float, sort_key: str, status_filter: str) -> None:
     interval = validate_interval(interval, "console_interval")
     while not stop.is_set():
         clear_screen()
-        print(ConsoleRenderer.render(state))
+        print(ConsoleRenderer.render(state, sort_key, status_filter))
         stop.wait(interval)
 
 
@@ -1307,6 +1627,20 @@ def install_signal_handlers(stop: threading.Event) -> None:
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
+
+
+def create_reader(config: MonitorConfig) -> SampleProvider:
+    if config.selftest_mode:
+        return SelfTestReader(config.selftest_interfaces, config.selftest_seed)
+    if config.replay_path:
+        return ReplayReader(config.replay_path)
+    return LinuxNetReader()
+
+
+def adjust_runtime_interval(config: MonitorConfig) -> float:
+    if config.replay_path:
+        return config.interval / config.replay_speed
+    return config.interval
 
 
 def main() -> int:
@@ -1322,11 +1656,13 @@ def main() -> int:
         config_data = load_config_from_file(args.config)
         config = merge_config(args, config_data)
         validate_interval(args.console_interval, "console_interval")
+        reader = create_reader(config)
+        config.interval = adjust_runtime_interval(config)
     except Exception as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 1
 
-    state = MonitorState(config)
+    state = MonitorState(config, reader)
     worker = MonitorWorker(state)
     stop = threading.Event()
     install_signal_handlers(stop)
@@ -1342,7 +1678,7 @@ def main() -> int:
     if not args.quiet:
         console_thread = threading.Thread(
             target=run_console_loop,
-            args=(state, stop, args.console_interval),
+            args=(state, stop, args.console_interval, config.console_sort, config.console_filter_status),
             name="console-renderer",
             daemon=True,
         )
