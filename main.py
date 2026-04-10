@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import math
 import os
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
@@ -282,15 +284,21 @@ class LinuxNetReader:
         self.sys_net = Path("/sys/class/net")
         self.proc_net_dev = Path("/proc/net/dev")
         self.proc_if_inet6 = Path("/proc/net/if_inet6")
+        self._cached_interfaces: Optional[List[str]] = None
+        self._cache_time: Optional[float] = None
+        self._cache_ttl: float = 5.0
 
-    def list_interfaces(self) -> List[str]:
+    def list_interfaces(self, force_refresh: bool = False) -> List[str]:
+        now = time.monotonic()
+        if not force_refresh and self._cached_interfaces is not None and self._cache_time is not None:
+            if (now - self._cache_time) < self._cache_ttl:
+                return self._cached_interfaces
         try:
-            return sorted(
-                p.name for p in self.sys_net.iterdir()
-                if p.exists()
-            )
+            self._cached_interfaces = sorted(p.name for p in self.sys_net.iterdir() if p.exists())
+            self._cache_time = now
         except OSError:
-            return []
+            self._cached_interfaces = []
+        return self._cached_interfaces
 
     def parse_proc_net_dev(self) -> Dict[str, InterfaceCounters]:
         result: Dict[str, InterfaceCounters] = {}
@@ -343,8 +351,6 @@ class LinuxNetReader:
     def get_ipv4(self, iface: str) -> Optional[str]:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                import fcntl
-                import struct
                 encoded = iface.encode("utf-8")
                 if len(encoded) > 15:
                     return None
@@ -421,14 +427,15 @@ class AnomalyEngine:
         self.policy = policy
         self._event_id = 0
         self._last_event_times: Dict[Tuple[str, str, str], float] = {}
+        self._lock = threading.RLock()
 
     def next_event_id(self) -> int:
-        self._event_id += 1
-        return self._event_id
+        with self._lock:
+            self._event_id += 1
+            return self._event_id
 
     def baseline_snapshot(self, baseline: InterfaceBaseline, metric: str) -> BaselineSnapshot:
-        snap = baseline.as_dict()[metric]
-        return snap
+        return baseline.as_dict()[metric]
 
     def maybe_emit(
         self,
@@ -447,10 +454,11 @@ class AnomalyEngine:
         tags: Optional[List[str]] = None,
     ) -> Optional[AnomalyEvent]:
         key = (iface, category, metric)
-        last_ts = self._last_event_times.get(key)
-        if last_ts is not None and (ts_mono - last_ts) < self.policy.cooldown_seconds:
-            return None
-        self._last_event_times[key] = ts_mono
+        with self._lock:
+            last_ts = self._last_event_times.get(key)
+            if last_ts is not None and (ts_mono - last_ts) < self.policy.cooldown_seconds:
+                return None
+            self._last_event_times[key] = ts_mono
         return AnomalyEvent(
             event_id=self.next_event_id(),
             ts_wall=ts_wall,
@@ -482,11 +490,16 @@ class AnomalyEngine:
             return None
         mean = baseline.mean
         stdev = baseline.stdev
-        ratio = (value / mean) if mean > 0 else (float("inf") if value > 0 else 1.0)
+        if mean > 0:
+            ratio = value / mean
+        elif value > 0:
+            ratio = float("inf")
+        else:
+            ratio = 1.0
         zscore = ((value - mean) / stdev) if stdev > 0 else 0.0
 
         if kind == "spike":
-            if ratio >= self.policy.spike_ratio_crit or zscore >= self.policy.zscore_crit:
+            if (ratio >= self.policy.spike_ratio_crit and not math.isinf(ratio)) or zscore >= self.policy.zscore_crit:
                 return self.maybe_emit(
                     iface,
                     ts_wall,
@@ -502,7 +515,7 @@ class AnomalyEngine:
                     ratio,
                     [kind],
                 )
-            if ratio >= self.policy.spike_ratio_warn or zscore >= self.policy.zscore_warn:
+            if (ratio >= self.policy.spike_ratio_warn and not math.isinf(ratio)) or zscore >= self.policy.zscore_warn:
                 return self.maybe_emit(
                     iface,
                     ts_wall,
@@ -521,7 +534,7 @@ class AnomalyEngine:
             return None
 
         if kind == "drop":
-            if mean <= 0:
+            if mean <= 0 or math.isinf(ratio):
                 return None
             if ratio <= self.policy.drop_ratio_crit:
                 return self.maybe_emit(
@@ -729,9 +742,23 @@ class MonitorState:
         self.cycles = 0
         self.last_tick_wall: Optional[float] = None
         self.last_tick_mono: Optional[float] = None
+        self._interface_list_cache: Optional[List[str]] = None
+        self._interface_cache_time: Optional[float] = None
 
     def selected_interfaces(self) -> List[str]:
-        names = self.reader.list_interfaces()
+        now = time.monotonic()
+        if self._interface_list_cache is not None and self._interface_cache_time is not None:
+            if (now - self._interface_cache_time) < 5.0:
+                names = self._interface_list_cache
+            else:
+                names = self.reader.list_interfaces(force_refresh=True)
+                self._interface_list_cache = names
+                self._interface_cache_time = now
+        else:
+            names = self.reader.list_interfaces()
+            self._interface_list_cache = names
+            self._interface_cache_time = now
+
         if self.config.include:
             allowed = set(self.config.include)
             names = [name for name in names if name in allowed]
@@ -759,15 +786,21 @@ class MonitorState:
         latest = state.latest
         previous = state.previous
         rates = state.latest_rates
+        baseline_dict = {}
+        for key, value in state.baseline.as_dict().items():
+            baseline_dict[key] = {
+                "samples": value.samples,
+                "mean": value.mean,
+                "stdev": value.stdev,
+                "minimum": value.minimum,
+                "maximum": value.maximum,
+            }
         return {
             "iface": iface,
             "latest": asdict(latest) if latest is not None else None,
             "previous": asdict(previous) if previous is not None else None,
             "rates": asdict(rates) if rates is not None else None,
-            "baseline": {
-                key: asdict(value)
-                for key, value in state.baseline.as_dict().items()
-            },
+            "baseline": baseline_dict,
             "events": [asdict(event) for event in list(state.events)],
             "recent_rates": list(state.recent_rates),
             "last_state_change": state.last_state_change,
@@ -887,7 +920,17 @@ class MonitorWorker:
 class JsonResponse:
     @staticmethod
     def send(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        try:
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as e:
+            error_body = json.dumps({"error": "serialization failed", "detail": str(e)}).encode("utf-8")
+            handler.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(error_body)))
+            handler.end_headers()
+            handler.wfile.write(error_body)
+            return
+
         handler.send_response(code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
@@ -957,7 +1000,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             severity = first(query.get("severity"))
             limit_raw = first(query.get("limit")) or "100"
             try:
-                limit = max(1, min(int(limit_raw), 5000))
+                limit_val = int(limit_raw)
+                if limit_val <= 0:
+                    limit_val = 100
+                limit = max(1, min(limit_val, 5000))
             except ValueError:
                 JsonResponse.send(self, HTTPStatus.BAD_REQUEST, {"error": "invalid limit"})
                 return
@@ -982,10 +1028,11 @@ class ConsoleRenderer:
     def human_bytes_per_second(value: float) -> str:
         units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
         idx = 0
-        while value >= 1024 and idx < len(units) - 1:
-            value /= 1024.0
+        val = value
+        while val >= 1024 and idx < len(units) - 1:
+            val /= 1024.0
             idx += 1
-        return f"{value:.2f} {units[idx]}"
+        return f"{val:.2f} {units[idx]}"
 
     @staticmethod
     def human_pps(value: float) -> str:
@@ -1120,8 +1167,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def clear_screen() -> None:
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
 
 
 def run_console_loop(state: MonitorState, stop: threading.Event, interval: float) -> None:
