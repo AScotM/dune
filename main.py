@@ -24,7 +24,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 
 APP_NAME = "cgnet-anomaly"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 
 @dataclass(slots=True)
@@ -140,64 +140,26 @@ class InterfaceBaseline:
         self.rx_drop_ps.push(rates.rx_drop_ps)
         self.tx_drop_ps.push(rates.tx_drop_ps)
 
+    def snapshot(self, metric: str) -> BaselineSnapshot:
+        stats = getattr(self, metric)
+        return BaselineSnapshot(
+            samples=stats.count,
+            mean=stats.mean,
+            stdev=stats.stdev,
+            minimum=stats.minimum,
+            maximum=stats.maximum,
+        )
+
     def as_dict(self) -> Dict[str, BaselineSnapshot]:
         return {
-            "rx_bps": BaselineSnapshot(
-                self.rx_bps.count,
-                self.rx_bps.mean,
-                self.rx_bps.stdev,
-                self.rx_bps.minimum,
-                self.rx_bps.maximum,
-            ),
-            "tx_bps": BaselineSnapshot(
-                self.tx_bps.count,
-                self.tx_bps.mean,
-                self.tx_bps.stdev,
-                self.tx_bps.minimum,
-                self.tx_bps.maximum,
-            ),
-            "rx_pps": BaselineSnapshot(
-                self.rx_pps.count,
-                self.rx_pps.mean,
-                self.rx_pps.stdev,
-                self.rx_pps.minimum,
-                self.rx_pps.maximum,
-            ),
-            "tx_pps": BaselineSnapshot(
-                self.tx_pps.count,
-                self.tx_pps.mean,
-                self.tx_pps.stdev,
-                self.tx_pps.minimum,
-                self.tx_pps.maximum,
-            ),
-            "rx_errs_ps": BaselineSnapshot(
-                self.rx_errs_ps.count,
-                self.rx_errs_ps.mean,
-                self.rx_errs_ps.stdev,
-                self.rx_errs_ps.minimum,
-                self.rx_errs_ps.maximum,
-            ),
-            "tx_errs_ps": BaselineSnapshot(
-                self.tx_errs_ps.count,
-                self.tx_errs_ps.mean,
-                self.tx_errs_ps.stdev,
-                self.tx_errs_ps.minimum,
-                self.tx_errs_ps.maximum,
-            ),
-            "rx_drop_ps": BaselineSnapshot(
-                self.rx_drop_ps.count,
-                self.rx_drop_ps.mean,
-                self.rx_drop_ps.stdev,
-                self.rx_drop_ps.minimum,
-                self.rx_drop_ps.maximum,
-            ),
-            "tx_drop_ps": BaselineSnapshot(
-                self.tx_drop_ps.count,
-                self.tx_drop_ps.mean,
-                self.tx_drop_ps.stdev,
-                self.tx_drop_ps.minimum,
-                self.tx_drop_ps.maximum,
-            ),
+            "rx_bps": self.snapshot("rx_bps"),
+            "tx_bps": self.snapshot("tx_bps"),
+            "rx_pps": self.snapshot("rx_pps"),
+            "tx_pps": self.snapshot("tx_pps"),
+            "rx_errs_ps": self.snapshot("rx_errs_ps"),
+            "tx_errs_ps": self.snapshot("tx_errs_ps"),
+            "rx_drop_ps": self.snapshot("rx_drop_ps"),
+            "tx_drop_ps": self.snapshot("tx_drop_ps"),
         }
 
 
@@ -220,6 +182,14 @@ class AnomalyEvent:
 
 
 @dataclass(slots=True)
+class InterfaceHealth:
+    status: str = "unknown"
+    score: int = 0
+    reasons: List[str] = field(default_factory=list)
+    last_evaluated_wall: float = 0.0
+
+
+@dataclass(slots=True)
 class InterfaceState:
     latest: Optional[InterfaceSample] = None
     previous: Optional[InterfaceSample] = None
@@ -229,6 +199,7 @@ class InterfaceState:
     recent_rates: Deque[Dict[str, float]] = field(default_factory=lambda: deque(maxlen=256))
     last_state_change: Optional[float] = None
     flap_count: int = 0
+    health: InterfaceHealth = field(default_factory=InterfaceHealth)
 
 
 @dataclass(slots=True)
@@ -248,6 +219,7 @@ class ThresholdPolicy:
     flap_warn_count: int = 2
     flap_crit_count: int = 4
     cooldown_seconds: float = 10.0
+    anomaly_freeze_baseline: bool = True
 
 
 @dataclass(slots=True)
@@ -255,8 +227,12 @@ class MonitorConfig:
     interval: float = 2.0
     include: List[str] = field(default_factory=list)
     exclude_loopback: bool = False
-    event_history: int = 1024
+    global_event_history: int = 1024
+    interface_event_history: int = 256
     rate_history: int = 256
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 8080
+    event_log_path: Optional[str] = None
     policy: ThresholdPolicy = field(default_factory=ThresholdPolicy)
 
 
@@ -422,6 +398,26 @@ class RateCalculator:
         )
 
 
+class EventStore:
+    def __init__(self, path: Optional[str]) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+
+    def append(self, event: AnomalyEvent) -> None:
+        if not self.path:
+            return
+        record = asdict(event)
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            try:
+                parent = Path(self.path).expanduser().resolve().parent
+                parent.mkdir(parents=True, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                logging.exception("failed to append event log")
+
+
 class AnomalyEngine:
     def __init__(self, policy: ThresholdPolicy) -> None:
         self.policy = policy
@@ -435,7 +431,7 @@ class AnomalyEngine:
             return self._event_id
 
     def baseline_snapshot(self, baseline: InterfaceBaseline, metric: str) -> BaselineSnapshot:
-        return baseline.as_dict()[metric]
+        return baseline.snapshot(metric)
 
     def maybe_emit(
         self,
@@ -499,7 +495,7 @@ class AnomalyEngine:
         zscore = ((value - mean) / stdev) if stdev > 0 else 0.0
 
         if kind == "spike":
-            if (ratio >= self.policy.spike_ratio_crit and not math.isinf(ratio)) or zscore >= self.policy.zscore_crit:
+            if (math.isinf(ratio) and value > 0) or zscore >= self.policy.zscore_crit or ratio >= self.policy.spike_ratio_crit:
                 return self.maybe_emit(
                     iface,
                     ts_wall,
@@ -515,7 +511,7 @@ class AnomalyEngine:
                     ratio,
                     [kind],
                 )
-            if (ratio >= self.policy.spike_ratio_warn and not math.isinf(ratio)) or zscore >= self.policy.zscore_warn:
+            if zscore >= self.policy.zscore_warn or ratio >= self.policy.spike_ratio_warn:
                 return self.maybe_emit(
                     iface,
                     ts_wall,
@@ -729,6 +725,54 @@ class AnomalyEngine:
         return events
 
 
+class HealthEvaluator:
+    @staticmethod
+    def from_state(state: InterfaceState, now_wall: float) -> InterfaceHealth:
+        score = 0
+        reasons: List[str] = []
+
+        latest = state.latest
+        rates = state.latest_rates
+
+        if latest is None or rates is None:
+            return InterfaceHealth(status="unknown", score=0, reasons=["no sample"], last_evaluated_wall=now_wall)
+
+        if latest.identity.operstate not in {"up", "unknown"}:
+            score += 50
+            reasons.append(f"operstate={latest.identity.operstate}")
+
+        if rates.rx_errs_ps > 0 or rates.tx_errs_ps > 0:
+            score += 25
+            reasons.append("errors")
+
+        if rates.rx_drop_ps > 0 or rates.tx_drop_ps > 0:
+            score += 25
+            reasons.append("drops")
+
+        recent = list(state.events)[-10:]
+        for event in recent:
+            if event.severity == "critical":
+                score += 40
+            elif event.severity == "warning":
+                score += 15
+
+        if state.flap_count >= 4:
+            score += 40
+            reasons.append("flapping")
+        elif state.flap_count >= 2:
+            score += 20
+            reasons.append("instability")
+
+        if score >= 80:
+            status = "critical"
+        elif score >= 30:
+            status = "warning"
+        else:
+            status = "healthy"
+
+        return InterfaceHealth(status=status, score=score, reasons=sorted(set(reasons)), last_evaluated_wall=now_wall)
+
+
 class MonitorState:
     def __init__(self, config: MonitorConfig) -> None:
         self.config = config
@@ -736,8 +780,9 @@ class MonitorState:
         self.started_mono = time.monotonic()
         self.reader = LinuxNetReader()
         self.engine = AnomalyEngine(config.policy)
+        self.store = EventStore(config.event_log_path)
         self.interfaces: Dict[str, InterfaceState] = {}
-        self.global_events: Deque[AnomalyEvent] = deque(maxlen=config.event_history)
+        self.global_events: Deque[AnomalyEvent] = deque(maxlen=config.global_event_history)
         self.lock = threading.RLock()
         self.cycles = 0
         self.last_tick_wall: Optional[float] = None
@@ -765,6 +810,23 @@ class MonitorState:
         if self.config.exclude_loopback:
             names = [name for name in names if name != "lo"]
         return names
+
+    def summary(self) -> Dict[str, Any]:
+        with self.lock:
+            interface_count = len(self.interfaces)
+            status_counts = {"healthy": 0, "warning": 0, "critical": 0, "unknown": 0}
+            for state in self.interfaces.values():
+                status_counts[state.health.status] = status_counts.get(state.health.status, 0) + 1
+            return {
+                "app": APP_NAME,
+                "version": APP_VERSION,
+                "uptime": time.monotonic() - self.started_mono,
+                "cycles": self.cycles,
+                "interface_count": interface_count,
+                "events_total": len(self.global_events),
+                "health": status_counts,
+                "last_tick_wall": self.last_tick_wall,
+            }
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -805,6 +867,7 @@ class MonitorState:
             "recent_rates": list(state.recent_rates),
             "last_state_change": state.last_state_change,
             "flap_count": state.flap_count,
+            "health": asdict(state.health),
         }
 
     def list_interface_names(self) -> List[str]:
@@ -828,6 +891,19 @@ class MonitorState:
         items = items[-limit:]
         return [asdict(item) for item in items]
 
+    def apply_events(self, state: InterfaceState, events: List[AnomalyEvent]) -> None:
+        for event in events:
+            state.events.append(event)
+            self.global_events.append(event)
+            self.store.append(event)
+
+    def maybe_update_baseline(self, state: InterfaceState, rates: InterfaceRates, events: List[AnomalyEvent]) -> None:
+        if rates.elapsed <= 0:
+            return
+        if self.config.policy.anomaly_freeze_baseline and events:
+            return
+        state.baseline.push(rates)
+
     def update(self) -> None:
         selected = self.selected_interfaces()
         samples = self.reader.collect(selected)
@@ -836,7 +912,7 @@ class MonitorState:
                 state = self.interfaces.setdefault(
                     iface,
                     InterfaceState(
-                        events=deque(maxlen=self.config.event_history),
+                        events=deque(maxlen=self.config.interface_event_history),
                         recent_rates=deque(maxlen=self.config.rate_history),
                     ),
                 )
@@ -871,11 +947,10 @@ class MonitorState:
                     })
 
                     events = self.engine.evaluate(iface, sample, rates, state)
-                    for event in events:
-                        state.events.append(event)
-                        self.global_events.append(event)
+                    self.apply_events(state, events)
+                    self.maybe_update_baseline(state, rates, events)
 
-                    state.baseline.push(rates)
+                state.health = HealthEvaluator.from_state(state, sample.timestamp_wall)
 
             to_remove = [iface for iface in self.interfaces if iface not in samples]
             for iface in to_remove:
@@ -953,6 +1028,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        segments = [segment for segment in path.split("/") if segment]
 
         if path == "/":
             JsonResponse.send(
@@ -964,6 +1040,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "endpoints": [
                         "/health",
                         "/v1/status",
+                        "/v1/summary",
                         "/v1/interfaces",
                         "/v1/interfaces/{iface}",
                         "/v1/events",
@@ -981,13 +1058,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             JsonResponse.send(self, HTTPStatus.OK, state.snapshot())
             return
 
+        if path == "/v1/summary":
+            JsonResponse.send(self, HTTPStatus.OK, state.summary())
+            return
+
         if path == "/v1/interfaces":
             names = state.list_interface_names()
             JsonResponse.send(self, HTTPStatus.OK, {"interfaces": names, "count": len(names)})
             return
 
-        if path.startswith("/v1/interfaces/"):
-            iface = path.split("/", 3)[3] if len(path.split("/", 3)) == 4 else ""
+        if len(segments) == 3 and segments[0] == "v1" and segments[1] == "interfaces":
+            iface = urllib.parse.unquote(segments[2])
             data = state.get_interface(iface)
             if data is None:
                 JsonResponse.send(self, HTTPStatus.NOT_FOUND, {"error": "interface not found", "iface": iface})
@@ -1049,9 +1130,9 @@ class ConsoleRenderer:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             lines.append(f"{APP_NAME} {APP_VERSION}  time={ts}  cycles={state.cycles}")
             lines.append(
-                f"{'IFACE':<12} {'STATE':<12} {'RX':>14} {'TX':>14} {'RX PPS':>12} {'TX PPS':>12} {'EVENTS':>8}"
+                f"{'IFACE':<12} {'STATE':<12} {'HEALTH':<10} {'RX':>14} {'TX':>14} {'RX PPS':>12} {'TX PPS':>12} {'EVENTS':>8}"
             )
-            lines.append("-" * 92)
+            lines.append("-" * 106)
             for iface in sorted(state.interfaces):
                 item = state.interfaces[iface]
                 latest = item.latest
@@ -1061,6 +1142,7 @@ class ConsoleRenderer:
                 lines.append(
                     f"{iface:<12} "
                     f"{latest.identity.operstate:<12} "
+                    f"{item.health.status:<10} "
                     f"{ConsoleRenderer.human_bytes_per_second(rates.rx_bps):>14} "
                     f"{ConsoleRenderer.human_bytes_per_second(rates.tx_bps):>14} "
                     f"{ConsoleRenderer.human_pps(rates.rx_pps):>12} "
@@ -1099,6 +1181,30 @@ def load_config_from_file(path: Optional[str]) -> Dict[str, Any]:
     return data
 
 
+def validate_host(value: str) -> str:
+    if not value:
+        raise ValueError("host must not be empty")
+    return value
+
+
+def validate_port(value: int) -> int:
+    if not (1 <= value <= 65535):
+        raise ValueError("port must be between 1 and 65535")
+    return value
+
+
+def validate_interval(value: float, name: str) -> float:
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
+def validate_history(value: int, name: str) -> int:
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
 def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfig:
     policy_data = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
     policy = ThresholdPolicy(
@@ -1117,6 +1223,7 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         flap_warn_count=int(policy_data.get("flap_warn_count", args.flap_warn_count)),
         flap_crit_count=int(policy_data.get("flap_crit_count", args.flap_crit_count)),
         cooldown_seconds=float(policy_data.get("cooldown_seconds", args.cooldown_seconds)),
+        anomaly_freeze_baseline=bool(policy_data.get("anomaly_freeze_baseline", args.anomaly_freeze_baseline)),
     )
     include = data.get("include")
     if include is None:
@@ -1125,12 +1232,23 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         raise ValueError("include must be a list")
     include = [str(item) for item in include]
 
+    bind_host = validate_host(str(data.get("bind_host", args.host)))
+    bind_port = validate_port(int(data.get("bind_port", args.port)))
+    interval = validate_interval(float(data.get("interval", args.interval)), "interval")
+    global_event_history = validate_history(int(data.get("global_event_history", args.global_event_history)), "global_event_history")
+    interface_event_history = validate_history(int(data.get("interface_event_history", args.interface_event_history)), "interface_event_history")
+    rate_history = validate_history(int(data.get("rate_history", args.rate_history)), "rate_history")
+
     return MonitorConfig(
-        interval=float(data.get("interval", args.interval)),
+        interval=interval,
         include=include,
         exclude_loopback=bool(data.get("exclude_loopback", args.exclude_loopback)),
-        event_history=int(data.get("event_history", args.event_history)),
-        rate_history=int(data.get("rate_history", args.rate_history)),
+        global_event_history=global_event_history,
+        interface_event_history=interface_event_history,
+        rate_history=rate_history,
+        bind_host=bind_host,
+        bind_port=bind_port,
+        event_log_path=data.get("event_log_path", args.event_log_path),
         policy=policy,
     )
 
@@ -1142,8 +1260,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval", type=float, default=2.0, help="sampling interval")
     parser.add_argument("--include", default="", help="comma-separated interface allow-list")
     parser.add_argument("--exclude-loopback", action="store_true", help="exclude lo")
-    parser.add_argument("--event-history", type=int, default=1024, help="global and per-interface event history")
+    parser.add_argument("--global-event-history", type=int, default=1024, help="global event history")
+    parser.add_argument("--interface-event-history", type=int, default=256, help="per-interface event history")
     parser.add_argument("--rate-history", type=int, default=256, help="per-interface rate history")
+    parser.add_argument("--event-log-path", help="append anomaly events to JSONL file")
     parser.add_argument("--config", help="JSON config file")
     parser.add_argument("--quiet", action="store_true", help="disable console rendering")
     parser.add_argument("--console-interval", type=float, default=2.0, help="console refresh interval")
@@ -1162,6 +1282,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flap-warn-count", type=int, default=2)
     parser.add_argument("--flap-crit-count", type=int, default=4)
     parser.add_argument("--cooldown-seconds", type=float, default=10.0)
+    parser.add_argument("--anomaly-freeze-baseline", action="store_true")
     parser.add_argument("--debug", action="store_true")
     return parser
 
@@ -1173,6 +1294,7 @@ def clear_screen() -> None:
 
 
 def run_console_loop(state: MonitorState, stop: threading.Event, interval: float) -> None:
+    interval = validate_interval(interval, "console_interval")
     while not stop.is_set():
         clear_screen()
         print(ConsoleRenderer.render(state))
@@ -1182,6 +1304,7 @@ def run_console_loop(state: MonitorState, stop: threading.Event, interval: float
 def install_signal_handlers(stop: threading.Event) -> None:
     def handler(_sig: int, _frame: Any) -> None:
         stop.set()
+
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
 
@@ -1198,6 +1321,7 @@ def main() -> int:
     try:
         config_data = load_config_from_file(args.config)
         config = merge_config(args, config_data)
+        validate_interval(args.console_interval, "console_interval")
     except Exception as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 1
@@ -1208,7 +1332,7 @@ def main() -> int:
     install_signal_handlers(stop)
 
     ApiHandler.state_ref = state
-    server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
+    server = ThreadingHTTPServer((config.bind_host, config.bind_port), ApiHandler)
     server_thread = threading.Thread(target=server.serve_forever, name="api-server", daemon=True)
 
     worker.start()
@@ -1224,17 +1348,18 @@ def main() -> int:
         )
         console_thread.start()
 
-    logging.info("api listening on http://%s:%d", args.host, args.port)
+    logging.info("api listening on http://%s:%d", config.bind_host, config.bind_port)
 
     try:
         while not stop.is_set():
             stop.wait(1.0)
     finally:
+        stop.set()
         server.shutdown()
         server.server_close()
         worker.stop()
+        server_thread.join(timeout=2.0)
         if console_thread is not None:
-            stop.set()
             console_thread.join(timeout=2.0)
 
     return 0
