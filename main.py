@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import fcntl
 import json
 import logging
@@ -19,6 +20,7 @@ import time
 import urllib.parse
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,7 +28,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 
 APP_NAME = "cgnet-anomaly"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 RATE_METRICS = (
     "rx_bps",
@@ -83,7 +85,11 @@ class InterfaceRates:
     tx_errs_ps: float = 0.0
     rx_drop_ps: float = 0.0
     tx_drop_ps: float = 0.0
-    elapsed: float = 0.0
+    elapsed_us: int = 0
+
+    @property
+    def elapsed(self) -> float:
+        return self.elapsed_us / 1_000_000.0
 
 
 @dataclass(slots=True)
@@ -95,6 +101,8 @@ class RollingStats:
     maximum: float = 0.0
 
     def push(self, value: float) -> None:
+        if math.isnan(value) or math.isinf(value):
+            return
         if self.count == 0:
             self.count = 1
             self.mean = value
@@ -200,7 +208,7 @@ class InterfaceState:
     latest_rates: Optional[InterfaceRates] = None
     baseline: InterfaceBaseline = field(default_factory=InterfaceBaseline)
     events: Deque[AnomalyEvent] = field(default_factory=lambda: deque(maxlen=256))
-    recent_rates: Deque[Dict[str, float]] = field(default_factory=lambda: deque(maxlen=256))
+    recent_rates: Deque[Tuple[float, float, float, float, float, float, float, float]] = field(default_factory=lambda: deque(maxlen=256))
     last_state_change: Optional[float] = None
     flap_count: int = 0
     health: InterfaceHealth = field(default_factory=InterfaceHealth)
@@ -246,6 +254,30 @@ class MonitorConfig:
     selftest_interfaces: int = 3
     selftest_seed: int = 1337
     policy: ThresholdPolicy = field(default_factory=ThresholdPolicy)
+    api_rate_limit: int = 60
+    enable_cors: bool = False
+
+
+class RateLimiter:
+    def __init__(self, requests_per_minute: int = 60):
+        self.requests_per_minute = requests_per_minute
+        self.requests: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, client_ip: str) -> bool:
+        if self.requests_per_minute <= 0:
+            return True
+        now = time.time()
+        window = 60.0
+        with self._lock:
+            if client_ip in self.requests:
+                self.requests[client_ip] = [t for t in self.requests[client_ip] if now - t < window]
+                if len(self.requests[client_ip]) >= self.requests_per_minute:
+                    return False
+                self.requests[client_ip].append(now)
+            else:
+                self.requests[client_ip] = [now]
+        return True
 
 
 class TextReader:
@@ -521,10 +553,10 @@ class RateCalculator:
     @staticmethod
     def calculate(previous: Optional[InterfaceSample], current: InterfaceSample) -> InterfaceRates:
         if previous is None:
-            return InterfaceRates(elapsed=0.0)
-        elapsed = current.timestamp_mono - previous.timestamp_mono
-        if elapsed <= 0:
-            return InterfaceRates(elapsed=0.0)
+            return InterfaceRates(elapsed_us=0)
+        elapsed_us = int((current.timestamp_mono - previous.timestamp_mono) * 1_000_000)
+        if elapsed_us <= 0:
+            return InterfaceRates(elapsed_us=0)
 
         def delta(a: int, b: int) -> int:
             if b >= a:
@@ -533,17 +565,18 @@ class RateCalculator:
 
         prev = previous.counters
         curr = current.counters
+        elapsed_sec = elapsed_us / 1_000_000.0
 
         return InterfaceRates(
-            rx_bps=delta(prev.rx_bytes, curr.rx_bytes) / elapsed,
-            tx_bps=delta(prev.tx_bytes, curr.tx_bytes) / elapsed,
-            rx_pps=delta(prev.rx_packets, curr.rx_packets) / elapsed,
-            tx_pps=delta(prev.tx_packets, curr.tx_packets) / elapsed,
-            rx_errs_ps=delta(prev.rx_errs, curr.rx_errs) / elapsed,
-            tx_errs_ps=delta(prev.tx_errs, curr.tx_errs) / elapsed,
-            rx_drop_ps=delta(prev.rx_drop, curr.rx_drop) / elapsed,
-            tx_drop_ps=delta(prev.tx_drop, curr.tx_drop) / elapsed,
-            elapsed=elapsed,
+            rx_bps=delta(prev.rx_bytes, curr.rx_bytes) / elapsed_sec,
+            tx_bps=delta(prev.tx_bytes, curr.tx_bytes) / elapsed_sec,
+            rx_pps=delta(prev.rx_packets, curr.rx_packets) / elapsed_sec,
+            tx_pps=delta(prev.tx_packets, curr.tx_packets) / elapsed_sec,
+            rx_errs_ps=delta(prev.rx_errs, curr.rx_errs) / elapsed_sec,
+            tx_errs_ps=delta(prev.tx_errs, curr.tx_errs) / elapsed_sec,
+            rx_drop_ps=delta(prev.rx_drop, curr.rx_drop) / elapsed_sec,
+            tx_drop_ps=delta(prev.tx_drop, curr.tx_drop) / elapsed_sec,
+            elapsed_us=elapsed_us,
         )
 
 
@@ -552,6 +585,7 @@ class EventStore:
         self.jsonl_path = jsonl_path
         self.sqlite_path = sqlite_path
         self._lock = threading.RLock()
+        self._sqlite_conn: Optional[sqlite3.Connection] = None
         if self.sqlite_path:
             self._init_sqlite()
 
@@ -559,8 +593,11 @@ class EventStore:
         try:
             parent = Path(self.sqlite_path).expanduser().resolve().parent
             parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.sqlite_path) as conn:
-                conn.execute(
+            self._sqlite_conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
+            self._sqlite_conn.execute("PRAGMA journal_mode=WAL")
+            self._sqlite_conn.execute("PRAGMA synchronous=NORMAL")
+            with self._sqlite_conn:
+                self._sqlite_conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS events (
                         event_id INTEGER PRIMARY KEY,
@@ -580,12 +617,12 @@ class EventStore:
                     )
                     """
                 )
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_wall ON events(ts_wall)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_iface ON events(iface)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
-                conn.commit()
+                self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_wall ON events(ts_wall)")
+                self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_iface ON events(iface)")
+                self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
         except sqlite3.Error:
             logging.exception("failed to initialize sqlite store")
+            self._sqlite_conn = None
 
     def append(self, event: AnomalyEvent) -> None:
         with self._lock:
@@ -606,11 +643,11 @@ class EventStore:
             logging.exception("failed to append jsonl event log")
 
     def _append_sqlite(self, event: AnomalyEvent) -> None:
-        if not self.sqlite_path:
+        if not self.sqlite_path or self._sqlite_conn is None:
             return
         try:
-            with sqlite3.connect(self.sqlite_path) as conn:
-                conn.execute(
+            with self._sqlite_conn:
+                self._sqlite_conn.execute(
                     """
                     INSERT OR REPLACE INTO events (
                         event_id, ts_wall, ts_mono, iface, severity, category, metric,
@@ -634,9 +671,12 @@ class EventStore:
                         json.dumps(event.tags, ensure_ascii=False),
                     ),
                 )
-                conn.commit()
         except sqlite3.Error:
             logging.exception("failed to append sqlite event log")
+
+    def close(self) -> None:
+        if self._sqlite_conn:
+            self._sqlite_conn.close()
 
 
 class AnomalyEngine:
@@ -670,6 +710,8 @@ class AnomalyEngine:
         ratio: float,
         tags: Optional[List[str]] = None,
     ) -> Optional[AnomalyEvent]:
+        if math.isnan(value) or math.isinf(value):
+            return None
         key = (iface, category, metric)
         with self._lock:
             last_ts = self._last_event_times.get(key)
@@ -800,6 +842,8 @@ class AnomalyEngine:
         crit: float,
         category: str,
     ) -> Optional[AnomalyEvent]:
+        if math.isnan(value) or math.isinf(value):
+            return None
         if value >= crit:
             return self.maybe_emit(
                 iface,
@@ -949,14 +993,13 @@ class AnomalyEngine:
 class HealthEvaluator:
     @staticmethod
     def from_state(state: InterfaceState, now_wall: float) -> InterfaceHealth:
+        if state.latest is None or state.latest_rates is None:
+            return InterfaceHealth(status="unknown", score=0, reasons=["no sample"], last_evaluated_wall=now_wall)
+
         score = 0
         reasons: List[str] = []
-
         latest = state.latest
         rates = state.latest_rates
-
-        if latest is None or rates is None:
-            return InterfaceHealth(status="unknown", score=0, reasons=["no sample"], last_evaluated_wall=now_wall)
 
         if latest.identity.operstate not in {"up", "unknown"}:
             score += 50
@@ -1010,6 +1053,7 @@ class MonitorState:
         self.last_tick_mono: Optional[float] = None
         self._interface_list_cache: Optional[List[str]] = None
         self._interface_cache_time: Optional[float] = None
+        self.cycle_times: Deque[float] = deque(maxlen=100)
 
     def selected_interfaces(self) -> List[str]:
         if self.config.selftest_mode:
@@ -1052,6 +1096,7 @@ class MonitorState:
             status_counts = {"healthy": 0, "warning": 0, "critical": 0, "unknown": 0}
             for state in self.interfaces.values():
                 status_counts[state.health.status] = status_counts.get(state.health.status, 0) + 1
+            avg_cycle = sum(self.cycle_times) / len(self.cycle_times) if self.cycle_times else 0.0
             return {
                 "app": APP_NAME,
                 "version": APP_VERSION,
@@ -1062,6 +1107,7 @@ class MonitorState:
                 "health": status_counts,
                 "last_tick_wall": self.last_tick_wall,
                 "mode": self.mode_name(),
+                "avg_cycle_ms": avg_cycle * 1000,
             }
 
     def mode_name(self) -> str:
@@ -1101,6 +1147,19 @@ class MonitorState:
                 "minimum": value.minimum,
                 "maximum": value.maximum,
             }
+        recent_rates_list = []
+        for rate_tuple in state.recent_rates:
+            recent_rates_list.append({
+                "ts_wall": rate_tuple[0],
+                "rx_bps": rate_tuple[1],
+                "tx_bps": rate_tuple[2],
+                "rx_pps": rate_tuple[3],
+                "tx_pps": rate_tuple[4],
+                "rx_errs_ps": rate_tuple[5],
+                "tx_errs_ps": rate_tuple[6],
+                "rx_drop_ps": rate_tuple[7],
+                "tx_drop_ps": rate_tuple[8],
+            })
         return {
             "iface": iface,
             "latest": asdict(latest) if latest is not None else None,
@@ -1108,7 +1167,7 @@ class MonitorState:
             "rates": asdict(rates) if rates is not None else None,
             "baseline": baseline_dict,
             "events": [asdict(event) for event in list(state.events)],
-            "recent_rates": list(state.recent_rates),
+            "recent_rates": recent_rates_list,
             "last_state_change": state.last_state_change,
             "flap_count": state.flap_count,
             "health": asdict(state.health),
@@ -1142,13 +1201,14 @@ class MonitorState:
             self.store.append(event)
 
     def maybe_update_baseline(self, state: InterfaceState, rates: InterfaceRates, events: List[AnomalyEvent]) -> None:
-        if rates.elapsed <= 0:
+        if rates.elapsed_us <= 0:
             return
         if self.config.policy.anomaly_freeze_baseline and events:
             return
         state.baseline.push(rates)
 
     def update(self) -> None:
+        cycle_start = time.monotonic()
         selected = self.selected_interfaces()
         samples = self.reader.collect(selected if selected else None)
         with self.lock:
@@ -1177,18 +1237,18 @@ class MonitorState:
                         state.flap_count = 1
                     state.last_state_change = now
 
-                if rates.elapsed > 0:
-                    state.recent_rates.append({
-                        "ts_wall": sample.timestamp_wall,
-                        "rx_bps": rates.rx_bps,
-                        "tx_bps": rates.tx_bps,
-                        "rx_pps": rates.rx_pps,
-                        "tx_pps": rates.tx_pps,
-                        "rx_errs_ps": rates.rx_errs_ps,
-                        "tx_errs_ps": rates.tx_errs_ps,
-                        "rx_drop_ps": rates.rx_drop_ps,
-                        "tx_drop_ps": rates.tx_drop_ps,
-                    })
+                if rates.elapsed_us > 0:
+                    state.recent_rates.append((
+                        sample.timestamp_wall,
+                        rates.rx_bps,
+                        rates.tx_bps,
+                        rates.rx_pps,
+                        rates.tx_pps,
+                        rates.rx_errs_ps,
+                        rates.tx_errs_ps,
+                        rates.rx_drop_ps,
+                        rates.tx_drop_ps,
+                    ))
 
                     events = self.engine.evaluate(iface, sample, rates, state)
                     self.apply_events(state, events)
@@ -1203,6 +1263,8 @@ class MonitorState:
             self.cycles += 1
             self.last_tick_wall = time.time()
             self.last_tick_mono = time.monotonic()
+            cycle_time = time.monotonic() - cycle_start
+            self.cycle_times.append(cycle_time)
 
 
 class MonitorWorker:
@@ -1253,20 +1315,41 @@ class JsonResponse:
         handler.send_response(code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
+        if handler.enable_cors:
+            handler.send_header("Access-Control-Allow-Origin", "*")
+            handler.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            handler.send_header("Access-Control-Allow-Headers", "Content-Type")
         handler.end_headers()
         handler.wfile.write(body)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     state_ref: Optional[MonitorState] = None
+    rate_limiter: Optional[RateLimiter] = None
+    enable_cors: bool = False
 
     def log_message(self, format: str, *args: Any) -> None:
         logging.info("%s - %s", self.address_string(), format % args)
+
+    def do_OPTIONS(self) -> None:
+        if self.enable_cors:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+        else:
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.end_headers()
 
     def do_GET(self) -> None:
         state = self.state_ref
         if state is None:
             JsonResponse.send(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "state unavailable"})
+            return
+
+        if self.rate_limiter and not self.rate_limiter.allow(self.client_address[0]):
+            JsonResponse.send(self, HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate limit exceeded"})
             return
 
         parsed = urllib.parse.urlparse(self.path)
@@ -1283,6 +1366,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "version": APP_VERSION,
                     "endpoints": [
                         "/health",
+                        "/metrics",
                         "/v1/status",
                         "/v1/summary",
                         "/v1/interfaces",
@@ -1296,6 +1380,17 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if path == "/health":
             JsonResponse.send(self, HTTPStatus.OK, {"status": "ok", "time": time.time()})
+            return
+
+        if path == "/metrics":
+            metrics = {
+                "uptime_seconds": time.monotonic() - state.started_mono,
+                "cycles_total": state.cycles,
+                "interfaces_total": len(state.interfaces),
+                "events_total": len(state.global_events),
+                "avg_cycle_ms": (sum(state.cycle_times) / len(state.cycle_times) * 1000) if state.cycle_times else 0,
+            }
+            JsonResponse.send(self, HTTPStatus.OK, metrics)
             return
 
         if path == "/v1/status":
@@ -1390,7 +1485,8 @@ class ConsoleRenderer:
         with state.lock:
             lines: List[str] = []
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            lines.append(f"{APP_NAME} {APP_VERSION}  time={ts}  cycles={state.cycles}  mode={state.mode_name()}  sort={sort_key}  filter={status_filter}")
+            avg_cycle = (sum(state.cycle_times) / len(state.cycle_times) * 1000) if state.cycle_times else 0
+            lines.append(f"{APP_NAME} {APP_VERSION}  time={ts}  cycles={state.cycles}  mode={state.mode_name()}  sort={sort_key}  filter={status_filter}  cycle_ms={avg_cycle:.1f}")
             lines.append(
                 f"{'IFACE':<12} {'STATE':<12} {'HEALTH':<10} {'SCORE':>6} {'RX':>14} {'TX':>14} {'RX PPS':>12} {'TX PPS':>12} {'EVENTS':>8}"
             )
@@ -1430,6 +1526,8 @@ class ConsoleRenderer:
 def parse_list(value: Optional[str]) -> List[str]:
     if not value:
         return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
@@ -1543,6 +1641,9 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
     if selftest_interfaces <= 0:
         raise ValueError("selftest_interfaces must be greater than 0")
 
+    api_rate_limit = int(data.get("api_rate_limit", getattr(args, "api_rate_limit", 60)))
+    enable_cors = bool(data.get("enable_cors", getattr(args, "enable_cors", False)))
+
     return MonitorConfig(
         interval=interval,
         include=include,
@@ -1562,6 +1663,8 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         selftest_interfaces=selftest_interfaces,
         selftest_seed=int(data.get("selftest_seed", args.selftest_seed)),
         policy=policy,
+        api_rate_limit=api_rate_limit,
+        enable_cors=enable_cors,
     )
 
 
@@ -1603,14 +1706,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flap-crit-count", type=int, default=4)
     parser.add_argument("--cooldown-seconds", type=float, default=10.0)
     parser.add_argument("--anomaly-freeze-baseline", action="store_true")
+    parser.add_argument("--api-rate-limit", type=int, default=60, help="requests per minute per IP")
+    parser.add_argument("--enable-cors", action="store_true", help="enable CORS headers")
     parser.add_argument("--debug", action="store_true")
     return parser
 
 
 def clear_screen() -> None:
     if sys.stdout.isatty():
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+        if sys.platform == "win32":
+            os.system("cls")
+        else:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
 
 
 def run_console_loop(state: MonitorState, stop: threading.Event, interval: float, sort_key: str, status_filter: str) -> None:
@@ -1668,6 +1776,8 @@ def main() -> int:
     install_signal_handlers(stop)
 
     ApiHandler.state_ref = state
+    ApiHandler.rate_limiter = RateLimiter(config.api_rate_limit)
+    ApiHandler.enable_cors = config.enable_cors
     server = ThreadingHTTPServer((config.bind_host, config.bind_port), ApiHandler)
     server_thread = threading.Thread(target=server.serve_forever, name="api-server", daemon=True)
 
@@ -1694,6 +1804,7 @@ def main() -> int:
         server.shutdown()
         server.server_close()
         worker.stop()
+        state.store.close()
         server_thread.join(timeout=2.0)
         if console_thread is not None:
             console_thread.join(timeout=2.0)
