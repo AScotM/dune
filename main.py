@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import array
 import fcntl
 import json
 import logging
@@ -20,15 +19,13 @@ import time
 import urllib.parse
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from functools import wraps
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
-
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 APP_NAME = "cgnet-anomaly"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 
 RATE_METRICS = (
     "rx_bps",
@@ -208,7 +205,7 @@ class InterfaceState:
     latest_rates: Optional[InterfaceRates] = None
     baseline: InterfaceBaseline = field(default_factory=InterfaceBaseline)
     events: Deque[AnomalyEvent] = field(default_factory=lambda: deque(maxlen=256))
-    recent_rates: Deque[Tuple[float, float, float, float, float, float, float, float]] = field(default_factory=lambda: deque(maxlen=256))
+    recent_rates: Deque[Tuple[float, float, float, float, float, float, float, float, float]] = field(default_factory=lambda: deque(maxlen=256))
     last_state_change: Optional[float] = None
     flap_count: int = 0
     health: InterfaceHealth = field(default_factory=InterfaceHealth)
@@ -256,13 +253,14 @@ class MonitorConfig:
     policy: ThresholdPolicy = field(default_factory=ThresholdPolicy)
     api_rate_limit: int = 60
     enable_cors: bool = False
+    sqlite_max_connections: int = 5
 
 
 class RateLimiter:
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
         self.requests: Dict[str, List[float]] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def allow(self, client_ip: str) -> bool:
         if self.requests_per_minute <= 0:
@@ -280,16 +278,40 @@ class RateLimiter:
         return True
 
 
+def coerce_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
+
+
+def coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class TextReader:
     @staticmethod
-    def read_text(path: str | Path) -> Optional[str]:
+    def read_text(path: Union[str, Path]) -> Optional[str]:
         try:
             return Path(path).read_text(encoding="utf-8").strip()
         except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
             return None
 
     @staticmethod
-    def read_int(path: str | Path) -> Optional[int]:
+    def read_int(path: Union[str, Path]) -> Optional[int]:
         value = TextReader.read_text(path)
         if value is None:
             return None
@@ -418,13 +440,15 @@ class LinuxNetReader(SampleProvider):
 
 
 class ReplayReader(SampleProvider):
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, speed: float = 1.0) -> None:
         self.path = Path(path)
+        self.speed = max(0.1, speed)
         self.frames = self._load_frames()
         self.index = 0
         self.started_wall = time.time()
         self.started_mono = time.monotonic()
         self.frame_count = len(self.frames)
+        self.last_frame_time = 0.0
 
     def _load_frames(self) -> List[Dict[str, Any]]:
         if not self.path.exists():
@@ -438,15 +462,27 @@ class ReplayReader(SampleProvider):
     def collect(self, selected: Optional[Iterable[str]] = None) -> Dict[str, InterfaceSample]:
         if not self.frames:
             return {}
-        frame = self.frames[self.index % len(self.frames)]
+        
+        if self.index >= len(self.frames):
+            self.index = 0
+        
+        frame = self.frames[self.index]
         self.index += 1
+        
         now_wall = time.time()
         now_mono = time.monotonic()
+        
+        elapsed = now_mono - self.started_mono
+        expected_frame_time = self.index * self.speed
+        if elapsed < expected_frame_time and self.index > 0:
+            time.sleep(expected_frame_time - elapsed)
+        
         names_filter = set(selected) if selected is not None else None
         result: Dict[str, InterfaceSample] = {}
         interfaces = frame.get("interfaces", {})
         if not isinstance(interfaces, dict):
             return result
+        
         for iface, payload in interfaces.items():
             if names_filter is not None and iface not in names_filter:
                 continue
@@ -454,14 +490,14 @@ class ReplayReader(SampleProvider):
             counters_data = payload.get("counters", {}) if isinstance(payload, dict) else {}
             identity = InterfaceIdentity(
                 name=iface,
-                operstate=str(identity_data.get("operstate", "up")),
+                operstate=coerce_str(identity_data.get("operstate")) or "up",
                 carrier=coerce_int(identity_data.get("carrier")),
                 mtu=coerce_int(identity_data.get("mtu")),
                 speed=coerce_int(identity_data.get("speed")),
                 duplex=coerce_str(identity_data.get("duplex")),
                 mac=coerce_str(identity_data.get("mac")),
                 ipv4=coerce_str(identity_data.get("ipv4")),
-                ipv6=[str(x) for x in identity_data.get("ipv6", [])] if isinstance(identity_data.get("ipv6", []), list) else [],
+                ipv6=[coerce_str(x) for x in identity_data.get("ipv6", []) if coerce_str(x) is not None] if isinstance(identity_data.get("ipv6", []), list) else [],
             )
             counters = InterfaceCounters(
                 rx_bytes=coerce_int(counters_data.get("rx_bytes")) or 0,
@@ -499,8 +535,8 @@ class SelfTestReader(SampleProvider):
                 continue
             c = self.counters[iface]
             burst = self.rng.random()
-            rx_step = self.rng.randint(20_000, 200_000)
-            tx_step = self.rng.randint(10_000, 140_000)
+            rx_step = self.rng.randint(20000, 200000)
+            tx_step = self.rng.randint(10000, 140000)
             if burst > 0.96:
                 rx_step *= self.rng.randint(10, 60)
                 tx_step *= self.rng.randint(10, 50)
@@ -580,24 +616,68 @@ class RateCalculator:
         )
 
 
+class SQLiteConnectionPool:
+    def __init__(self, db_path: str, max_connections: int = 5):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self._connections: List[sqlite3.Connection] = []
+        self._lock = threading.RLock()
+
+    def get_connection(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._connections:
+                conn = self._connections.pop()
+                try:
+                    conn.execute("SELECT 1")
+                    return conn
+                except sqlite3.Error:
+                    conn.close()
+            if len(self._connections) < self.max_connections:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                return conn
+            if self._connections:
+                return self._connections.pop()
+            return sqlite3.connect(self.db_path, check_same_thread=False)
+
+    def return_connection(self, conn: sqlite3.Connection) -> None:
+        with self._lock:
+            if len(self._connections) < self.max_connections:
+                self._connections.append(conn)
+            else:
+                conn.close()
+
+    def close_all(self) -> None:
+        with self._lock:
+            for conn in self._connections:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._connections.clear()
+
+
 class EventStore:
-    def __init__(self, jsonl_path: Optional[str], sqlite_path: Optional[str]) -> None:
+    def __init__(self, jsonl_path: Optional[str], sqlite_path: Optional[str], max_connections: int = 5):
         self.jsonl_path = jsonl_path
         self.sqlite_path = sqlite_path
         self._lock = threading.RLock()
-        self._sqlite_conn: Optional[sqlite3.Connection] = None
+        self._pool: Optional[SQLiteConnectionPool] = None
         if self.sqlite_path:
+            parent = Path(self.sqlite_path).expanduser().resolve().parent
+            parent.mkdir(parents=True, exist_ok=True)
+            self._pool = SQLiteConnectionPool(self.sqlite_path, max_connections)
             self._init_sqlite()
 
     def _init_sqlite(self) -> None:
+        if self._pool is None:
+            return
+        conn = None
         try:
-            parent = Path(self.sqlite_path).expanduser().resolve().parent
-            parent.mkdir(parents=True, exist_ok=True)
-            self._sqlite_conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
-            self._sqlite_conn.execute("PRAGMA journal_mode=WAL")
-            self._sqlite_conn.execute("PRAGMA synchronous=NORMAL")
-            with self._sqlite_conn:
-                self._sqlite_conn.execute(
+            conn = self._pool.get_connection()
+            with conn:
+                conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS events (
                         event_id INTEGER PRIMARY KEY,
@@ -617,12 +697,14 @@ class EventStore:
                     )
                     """
                 )
-                self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_wall ON events(ts_wall)")
-                self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_iface ON events(iface)")
-                self._sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_wall ON events(ts_wall)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_iface ON events(iface)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
         except sqlite3.Error:
             logging.exception("failed to initialize sqlite store")
-            self._sqlite_conn = None
+        finally:
+            if conn is not None and self._pool is not None:
+                self._pool.return_connection(conn)
 
     def append(self, event: AnomalyEvent) -> None:
         with self._lock:
@@ -643,13 +725,15 @@ class EventStore:
             logging.exception("failed to append jsonl event log")
 
     def _append_sqlite(self, event: AnomalyEvent) -> None:
-        if not self.sqlite_path or self._sqlite_conn is None:
+        if not self.sqlite_path or self._pool is None:
             return
+        conn = None
         try:
-            with self._sqlite_conn:
-                self._sqlite_conn.execute(
+            conn = self._pool.get_connection()
+            with conn:
+                conn.execute(
                     """
-                    INSERT OR REPLACE INTO events (
+                    INSERT INTO events (
                         event_id, ts_wall, ts_mono, iface, severity, category, metric,
                         message, value, baseline_mean, baseline_stdev, zscore, ratio, tags_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -673,10 +757,13 @@ class EventStore:
                 )
         except sqlite3.Error:
             logging.exception("failed to append sqlite event log")
+        finally:
+            if conn is not None and self._pool is not None:
+                self._pool.return_connection(conn)
 
     def close(self) -> None:
-        if self._sqlite_conn:
-            self._sqlite_conn.close()
+        if self._pool is not None:
+            self._pool.close_all()
 
 
 class AnomalyEngine:
@@ -1044,10 +1131,11 @@ class MonitorState:
         self.started_mono = time.monotonic()
         self.reader = reader
         self.engine = AnomalyEngine(config.policy)
-        self.store = EventStore(config.event_log_path, config.sqlite_path)
+        self.store = EventStore(config.event_log_path, config.sqlite_path, config.sqlite_max_connections)
         self.interfaces: Dict[str, InterfaceState] = {}
         self.global_events: Deque[AnomalyEvent] = deque(maxlen=config.global_event_history)
         self.lock = threading.RLock()
+        self.event_lock = threading.RLock()
         self.cycles = 0
         self.last_tick_wall: Optional[float] = None
         self.last_tick_mono: Optional[float] = None
@@ -1185,7 +1273,7 @@ class MonitorState:
             return self.interface_snapshot(iface, state)
 
     def list_events(self, iface: Optional[str] = None, severity: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-        with self.lock:
+        with self.event_lock:
             items = list(self.global_events)
         if iface is not None:
             items = [item for item in items if item.iface == iface]
@@ -1197,7 +1285,8 @@ class MonitorState:
     def apply_events(self, state: InterfaceState, events: List[AnomalyEvent]) -> None:
         for event in events:
             state.events.append(event)
-            self.global_events.append(event)
+            with self.event_lock:
+                self.global_events.append(event)
             self.store.append(event)
 
     def maybe_update_baseline(self, state: InterfaceState, rates: InterfaceRates, events: List[AnomalyEvent]) -> None:
@@ -1211,6 +1300,7 @@ class MonitorState:
         cycle_start = time.monotonic()
         selected = self.selected_interfaces()
         samples = self.reader.collect(selected if selected else None)
+        
         with self.lock:
             for iface, sample in samples.items():
                 state = self.interfaces.setdefault(
@@ -1544,30 +1634,6 @@ def load_config_from_file(path: Optional[str]) -> Dict[str, Any]:
     return data
 
 
-def coerce_int(value: Any) -> Optional[int]:
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def coerce_float(value: Any) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def coerce_str(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    return str(value)
-
-
 def validate_host(value: str) -> str:
     if not value:
         raise ValueError("host must not be empty")
@@ -1643,6 +1709,7 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
 
     api_rate_limit = int(data.get("api_rate_limit", getattr(args, "api_rate_limit", 60)))
     enable_cors = bool(data.get("enable_cors", getattr(args, "enable_cors", False)))
+    sqlite_max_connections = int(data.get("sqlite_max_connections", 5))
 
     return MonitorConfig(
         interval=interval,
@@ -1665,6 +1732,7 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         policy=policy,
         api_rate_limit=api_rate_limit,
         enable_cors=enable_cors,
+        sqlite_max_connections=sqlite_max_connections,
     )
 
 
@@ -1708,6 +1776,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anomaly-freeze-baseline", action="store_true")
     parser.add_argument("--api-rate-limit", type=int, default=60, help="requests per minute per IP")
     parser.add_argument("--enable-cors", action="store_true", help="enable CORS headers")
+    parser.add_argument("--sqlite-max-connections", type=int, default=5, help="max SQLite connections")
     parser.add_argument("--debug", action="store_true")
     return parser
 
@@ -1741,7 +1810,7 @@ def create_reader(config: MonitorConfig) -> SampleProvider:
     if config.selftest_mode:
         return SelfTestReader(config.selftest_interfaces, config.selftest_seed)
     if config.replay_path:
-        return ReplayReader(config.replay_path)
+        return ReplayReader(config.replay_path, config.replay_speed)
     return LinuxNetReader()
 
 
