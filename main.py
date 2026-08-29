@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 APP_NAME = "cgnet-anomaly"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.4.0"
 
 RATE_METRICS = (
     "rx_bps",
@@ -207,6 +207,7 @@ class InterfaceState:
     events: Deque[AnomalyEvent] = field(default_factory=lambda: deque(maxlen=256))
     recent_rates: Deque[Tuple[float, float, float, float, float, float, float, float, float]] = field(default_factory=lambda: deque(maxlen=256))
     last_state_change: Optional[float] = None
+    flap_times: Deque[float] = field(default_factory=deque)
     flap_count: int = 0
     health: InterfaceHealth = field(default_factory=InterfaceHealth)
 
@@ -228,6 +229,7 @@ class ThresholdPolicy:
     flap_warn_count: int = 2
     flap_crit_count: int = 4
     cooldown_seconds: float = 10.0
+    health_event_window_seconds: float = 300.0
     anomaly_freeze_baseline: bool = True
 
 
@@ -259,22 +261,27 @@ class MonitorConfig:
 class RateLimiter:
     def __init__(self, requests_per_minute: int = 60):
         self.requests_per_minute = requests_per_minute
-        self.requests: Dict[str, List[float]] = {}
+        self.requests: Dict[str, Deque[float]] = {}
         self._lock = threading.RLock()
+        self._last_cleanup = time.monotonic()
 
     def allow(self, client_ip: str) -> bool:
         if self.requests_per_minute <= 0:
             return True
-        now = time.time()
-        window = 60.0
+        now = time.monotonic()
+        cutoff = now - 60.0
         with self._lock:
-            if client_ip in self.requests:
-                self.requests[client_ip] = [t for t in self.requests[client_ip] if now - t < window]
-                if len(self.requests[client_ip]) >= self.requests_per_minute:
-                    return False
-                self.requests[client_ip].append(now)
-            else:
-                self.requests[client_ip] = [now]
+            bucket = self.requests.setdefault(client_ip, deque())
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.requests_per_minute:
+                return False
+            bucket.append(now)
+            if now - self._last_cleanup >= 60.0:
+                stale = [ip for ip, timestamps in self.requests.items() if not timestamps or timestamps[-1] <= cutoff]
+                for ip in stale:
+                    self.requests.pop(ip, None)
+                self._last_cleanup = now
         return True
 
 
@@ -440,15 +447,11 @@ class LinuxNetReader(SampleProvider):
 
 
 class ReplayReader(SampleProvider):
-    def __init__(self, path: str, speed: float = 1.0) -> None:
+    def __init__(self, path: str) -> None:
         self.path = Path(path)
-        self.speed = max(0.1, speed)
         self.frames = self._load_frames()
         self.index = 0
-        self.started_wall = time.time()
-        self.started_mono = time.monotonic()
         self.frame_count = len(self.frames)
-        self.last_frame_time = 0.0
 
     def _load_frames(self) -> List[Dict[str, Any]]:
         if not self.path.exists():
@@ -471,12 +474,7 @@ class ReplayReader(SampleProvider):
         
         now_wall = time.time()
         now_mono = time.monotonic()
-        
-        elapsed = now_mono - self.started_mono
-        expected_frame_time = self.index * self.speed
-        if elapsed < expected_frame_time and self.index > 0:
-            time.sleep(expected_frame_time - elapsed)
-        
+
         names_filter = set(selected) if selected is not None else None
         result: Dict[str, InterfaceSample] = {}
         interfaces = frame.get("interfaces", {})
@@ -618,44 +616,69 @@ class RateCalculator:
 
 class SQLiteConnectionPool:
     def __init__(self, db_path: str, max_connections: int = 5):
+        if max_connections <= 0:
+            raise ValueError("max_connections must be greater than 0")
         self.db_path = db_path
         self.max_connections = max_connections
         self._connections: List[sqlite3.Connection] = []
-        self._lock = threading.RLock()
+        self._total_connections = 0
+        self._closed = False
+        self._condition = threading.Condition(threading.RLock())
+
+    def _create_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
     def get_connection(self) -> sqlite3.Connection:
-        with self._lock:
-            if self._connections:
-                conn = self._connections.pop()
-                try:
-                    conn.execute("SELECT 1")
-                    return conn
-                except sqlite3.Error:
-                    conn.close()
-            if len(self._connections) < self.max_connections:
-                conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                return conn
-            if self._connections:
-                return self._connections.pop()
-            return sqlite3.connect(self.db_path, check_same_thread=False)
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise RuntimeError("connection pool is closed")
+                while self._connections:
+                    conn = self._connections.pop()
+                    try:
+                        conn.execute("SELECT 1")
+                        return conn
+                    except sqlite3.Error:
+                        conn.close()
+                        self._total_connections -= 1
+                if self._total_connections < self.max_connections:
+                    self._total_connections += 1
+                    break
+                self._condition.wait()
+        try:
+            return self._create_connection()
+        except Exception:
+            with self._condition:
+                self._total_connections -= 1
+                self._condition.notify()
+            raise
 
     def return_connection(self, conn: sqlite3.Connection) -> None:
-        with self._lock:
-            if len(self._connections) < self.max_connections:
-                self._connections.append(conn)
-            else:
-                conn.close()
+        with self._condition:
+            if self._closed:
+                try:
+                    conn.close()
+                finally:
+                    self._total_connections = max(0, self._total_connections - 1)
+                    self._condition.notify()
+                return
+            self._connections.append(conn)
+            self._condition.notify()
 
     def close_all(self) -> None:
-        with self._lock:
+        with self._condition:
+            self._closed = True
             for conn in self._connections:
                 try:
                     conn.close()
                 except sqlite3.Error:
                     pass
+            self._total_connections = max(0, self._total_connections - len(self._connections))
             self._connections.clear()
+            self._condition.notify_all()
 
 
 class EventStore:
@@ -702,6 +725,37 @@ class EventStore:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
         except sqlite3.Error:
             logging.exception("failed to initialize sqlite store")
+        finally:
+            if conn is not None and self._pool is not None:
+                self._pool.return_connection(conn)
+
+
+    def max_event_id(self) -> int:
+        if self._pool is None:
+            return 0
+        conn = None
+        try:
+            conn = self._pool.get_connection()
+            row = conn.execute("SELECT COALESCE(MAX(event_id), 0) FROM events").fetchone()
+            return int(row[0]) if row else 0
+        except (sqlite3.Error, TypeError, ValueError):
+            logging.exception("failed to read maximum sqlite event id")
+            return 0
+        finally:
+            if conn is not None and self._pool is not None:
+                self._pool.return_connection(conn)
+
+    def event_count(self) -> int:
+        if self._pool is None:
+            return 0
+        conn = None
+        try:
+            conn = self._pool.get_connection()
+            row = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+            return int(row[0]) if row else 0
+        except (sqlite3.Error, TypeError, ValueError):
+            logging.exception("failed to read sqlite event count")
+            return 0
         finally:
             if conn is not None and self._pool is not None:
                 self._pool.return_connection(conn)
@@ -767,9 +821,9 @@ class EventStore:
 
 
 class AnomalyEngine:
-    def __init__(self, policy: ThresholdPolicy) -> None:
+    def __init__(self, policy: ThresholdPolicy, initial_event_id: int = 0) -> None:
         self.policy = policy
-        self._event_id = 0
+        self._event_id = max(0, initial_event_id)
         self._last_event_times: Dict[Tuple[str, str, str], float] = {}
         self._lock = threading.RLock()
 
@@ -1079,7 +1133,7 @@ class AnomalyEngine:
 
 class HealthEvaluator:
     @staticmethod
-    def from_state(state: InterfaceState, now_wall: float) -> InterfaceHealth:
+    def from_state(state: InterfaceState, now_wall: float, now_mono: float, policy: ThresholdPolicy) -> InterfaceHealth:
         if state.latest is None or state.latest_rates is None:
             return InterfaceHealth(status="unknown", score=0, reasons=["no sample"], last_evaluated_wall=now_wall)
 
@@ -1100,17 +1154,18 @@ class HealthEvaluator:
             score += 25
             reasons.append("drops")
 
-        recent = list(state.events)[-10:]
+        cutoff = now_mono - policy.health_event_window_seconds
+        recent = [event for event in state.events if event.ts_mono >= cutoff][-10:]
         for event in recent:
             if event.severity == "critical":
                 score += 40
             elif event.severity == "warning":
                 score += 15
 
-        if state.flap_count >= 4:
+        if state.flap_count >= policy.flap_crit_count:
             score += 40
             reasons.append("flapping")
-        elif state.flap_count >= 2:
+        elif state.flap_count >= policy.flap_warn_count:
             score += 20
             reasons.append("instability")
 
@@ -1130,10 +1185,11 @@ class MonitorState:
         self.started_wall = time.time()
         self.started_mono = time.monotonic()
         self.reader = reader
-        self.engine = AnomalyEngine(config.policy)
         self.store = EventStore(config.event_log_path, config.sqlite_path, config.sqlite_max_connections)
+        self.engine = AnomalyEngine(config.policy, self.store.max_event_id())
         self.interfaces: Dict[str, InterfaceState] = {}
         self.global_events: Deque[AnomalyEvent] = deque(maxlen=config.global_event_history)
+        self.events_total = self.store.event_count()
         self.lock = threading.RLock()
         self.event_lock = threading.RLock()
         self.cycles = 0
@@ -1191,7 +1247,7 @@ class MonitorState:
                 "uptime": time.monotonic() - self.started_mono,
                 "cycles": self.cycles,
                 "interface_count": interface_count,
-                "events_total": len(self.global_events),
+                "events_total": self.events_total,
                 "health": status_counts,
                 "last_tick_wall": self.last_tick_wall,
                 "mode": self.mode_name(),
@@ -1217,7 +1273,7 @@ class MonitorState:
                     iface: self.interface_snapshot(iface, state)
                     for iface, state in self.interfaces.items()
                 },
-                "events_total": len(self.global_events),
+                "events_total": self.events_total,
                 "last_tick_wall": self.last_tick_wall,
                 "mode": self.mode_name(),
             }
@@ -1288,6 +1344,7 @@ class MonitorState:
             with self.event_lock:
                 self.global_events.append(event)
             self.store.append(event)
+            self.events_total += 1
 
     def maybe_update_baseline(self, state: InterfaceState, rates: InterfaceRates, events: List[AnomalyEvent]) -> None:
         if rates.elapsed_us <= 0:
@@ -1299,7 +1356,7 @@ class MonitorState:
     def update(self) -> None:
         cycle_start = time.monotonic()
         selected = self.selected_interfaces()
-        samples = self.reader.collect(selected if selected else None)
+        samples = self.reader.collect(selected)
         
         with self.lock:
             for iface, sample in samples.items():
@@ -1316,16 +1373,16 @@ class MonitorState:
                 rates = RateCalculator.calculate(prev, sample)
                 state.latest_rates = rates
 
+                now_mono = sample.timestamp_mono
+                cutoff = now_mono - self.config.policy.flap_window_seconds
+                while state.flap_times and state.flap_times[0] < cutoff:
+                    state.flap_times.popleft()
+
                 if prev is not None and prev.identity.operstate != sample.identity.operstate:
-                    now = sample.timestamp_mono
-                    if state.last_state_change is not None:
-                        if (now - state.last_state_change) <= self.config.policy.flap_window_seconds:
-                            state.flap_count += 1
-                        else:
-                            state.flap_count = 1
-                    else:
-                        state.flap_count = 1
-                    state.last_state_change = now
+                    state.flap_times.append(now_mono)
+                    state.last_state_change = now_mono
+
+                state.flap_count = len(state.flap_times)
 
                 if rates.elapsed_us > 0:
                     state.recent_rates.append((
@@ -1344,7 +1401,12 @@ class MonitorState:
                     self.apply_events(state, events)
                     self.maybe_update_baseline(state, rates, events)
 
-                state.health = HealthEvaluator.from_state(state, sample.timestamp_wall)
+                state.health = HealthEvaluator.from_state(
+                    state,
+                    sample.timestamp_wall,
+                    sample.timestamp_mono,
+                    self.config.policy,
+                )
 
             to_remove = [iface for iface in self.interfaces if iface not in samples]
             for iface in to_remove:
@@ -1473,13 +1535,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/metrics":
-            metrics = {
-                "uptime_seconds": time.monotonic() - state.started_mono,
-                "cycles_total": state.cycles,
-                "interfaces_total": len(state.interfaces),
-                "events_total": len(state.global_events),
-                "avg_cycle_ms": (sum(state.cycle_times) / len(state.cycle_times) * 1000) if state.cycle_times else 0,
-            }
+            with state.lock:
+                metrics = {
+                    "uptime_seconds": time.monotonic() - state.started_mono,
+                    "cycles_total": state.cycles,
+                    "interfaces_total": len(state.interfaces),
+                    "events_total": state.events_total,
+                    "avg_cycle_ms": (sum(state.cycle_times) / len(state.cycle_times) * 1000) if state.cycle_times else 0,
+                }
             JsonResponse.send(self, HTTPStatus.OK, metrics)
             return
 
@@ -1682,6 +1745,7 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         flap_warn_count=int(policy_data.get("flap_warn_count", args.flap_warn_count)),
         flap_crit_count=int(policy_data.get("flap_crit_count", args.flap_crit_count)),
         cooldown_seconds=float(policy_data.get("cooldown_seconds", args.cooldown_seconds)),
+        health_event_window_seconds=float(policy_data.get("health_event_window_seconds", args.health_event_window_seconds)),
         anomaly_freeze_baseline=bool(policy_data.get("anomaly_freeze_baseline", args.anomaly_freeze_baseline)),
     )
 
@@ -1708,8 +1772,12 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         raise ValueError("selftest_interfaces must be greater than 0")
 
     api_rate_limit = int(data.get("api_rate_limit", getattr(args, "api_rate_limit", 60)))
+    if api_rate_limit < 0:
+        raise ValueError("api_rate_limit must be greater than or equal to 0")
     enable_cors = bool(data.get("enable_cors", getattr(args, "enable_cors", False)))
-    sqlite_max_connections = int(data.get("sqlite_max_connections", 5))
+    sqlite_max_connections = int(data.get("sqlite_max_connections", args.sqlite_max_connections))
+    if sqlite_max_connections <= 0:
+        raise ValueError("sqlite_max_connections must be greater than 0")
 
     return MonitorConfig(
         interval=interval,
@@ -1773,7 +1841,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flap-warn-count", type=int, default=2)
     parser.add_argument("--flap-crit-count", type=int, default=4)
     parser.add_argument("--cooldown-seconds", type=float, default=10.0)
-    parser.add_argument("--anomaly-freeze-baseline", action="store_true")
+    parser.add_argument("--health-event-window-seconds", type=float, default=300.0)
+    parser.add_argument("--anomaly-freeze-baseline", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--api-rate-limit", type=int, default=60, help="requests per minute per IP")
     parser.add_argument("--enable-cors", action="store_true", help="enable CORS headers")
     parser.add_argument("--sqlite-max-connections", type=int, default=5, help="max SQLite connections")
@@ -1810,7 +1879,7 @@ def create_reader(config: MonitorConfig) -> SampleProvider:
     if config.selftest_mode:
         return SelfTestReader(config.selftest_interfaces, config.selftest_seed)
     if config.replay_path:
-        return ReplayReader(config.replay_path, config.replay_speed)
+        return ReplayReader(config.replay_path)
     return LinuxNetReader()
 
 
