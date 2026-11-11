@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 APP_NAME = "cgnet-anomaly"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 RATE_METRICS = (
     "rx_bps",
@@ -83,6 +83,7 @@ class InterfaceRates:
     rx_drop_ps: float = 0.0
     tx_drop_ps: float = 0.0
     elapsed_us: int = 0
+    counter_reset: bool = False
 
     @property
     def elapsed(self) -> float:
@@ -96,6 +97,13 @@ class RollingStats:
     m2: float = 0.0
     minimum: float = 0.0
     maximum: float = 0.0
+
+    def reset(self) -> None:
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.minimum = 0.0
+        self.maximum = 0.0
 
     def push(self, value: float) -> None:
         if math.isnan(value) or math.isinf(value):
@@ -148,7 +156,21 @@ class InterfaceBaseline:
     rx_drop_ps: RollingStats = field(default_factory=RollingStats)
     tx_drop_ps: RollingStats = field(default_factory=RollingStats)
 
-    def push(self, rates: InterfaceRates) -> None:
+    history: Deque[Tuple[float, ...]] = field(default_factory=deque)
+
+    def push(self, rates: InterfaceRates, window: int = 256) -> None:
+        values = tuple(float(getattr(rates, metric)) for metric in RATE_METRICS)
+        if not all(math.isfinite(value) for value in values):
+            return
+        self.history.append(values)
+        if len(self.history) > window:
+            self.history.popleft()
+            for metric in RATE_METRICS:
+                getattr(self, metric).reset()
+            for sample in self.history:
+                for metric, value in zip(RATE_METRICS, sample):
+                    getattr(self, metric).push(value)
+            return
         self.rx_bps.push(rates.rx_bps)
         self.tx_bps.push(rates.tx_bps)
         self.rx_pps.push(rates.rx_pps)
@@ -209,12 +231,15 @@ class InterfaceState:
     last_state_change: Optional[float] = None
     flap_times: Deque[float] = field(default_factory=deque)
     flap_count: int = 0
+    counter_resets: int = 0
+    baseline_restarts: int = 0
     health: InterfaceHealth = field(default_factory=InterfaceHealth)
 
 
 @dataclass(slots=True)
 class ThresholdPolicy:
     min_baseline_samples: int = 6
+    baseline_window: int = 256
     spike_ratio_warn: float = 2.5
     spike_ratio_crit: float = 5.0
     drop_ratio_warn: float = 0.20
@@ -522,6 +547,10 @@ class SelfTestReader(SampleProvider):
         self.names = [f"sim{i}" for i in range(1, max(1, count) + 1)]
         self.counters: Dict[str, InterfaceCounters] = {name: InterfaceCounters() for name in self.names}
         self.states: Dict[str, str] = {name: "up" for name in self.names}
+        self.identities = {
+            name: (f"02:00:00:00:00:{index:02x}", f"10.0.0.{index + 1}")
+            for index, name in enumerate(self.names, 1)
+        }
 
     def collect(self, selected: Optional[Iterable[str]] = None) -> Dict[str, InterfaceSample]:
         now_wall = time.time()
@@ -561,8 +590,8 @@ class SelfTestReader(SampleProvider):
                 mtu=1500,
                 speed=1000,
                 duplex="full",
-                mac=f"02:00:00:{self.rng.randint(0,255):02x}:{self.rng.randint(0,255):02x}:{self.rng.randint(0,255):02x}",
-                ipv4=f"10.0.0.{self.rng.randint(2, 250)}",
+                mac=self.identities[iface][0],
+                ipv4=self.identities[iface][1],
                 ipv6=[],
             )
             result[iface] = InterfaceSample(
@@ -600,6 +629,8 @@ class RateCalculator:
         prev = previous.counters
         curr = current.counters
         elapsed_sec = elapsed_us / 1_000_000.0
+        if any(getattr(curr, field_name) < getattr(prev, field_name) for field_name in InterfaceCounters.__dataclass_fields__):
+            return InterfaceRates(elapsed_us=elapsed_us, counter_reset=True)
 
         return InterfaceRates(
             rx_bps=delta(prev.rx_bytes, curr.rx_bytes) / elapsed_sec,
@@ -1314,6 +1345,8 @@ class MonitorState:
             "recent_rates": recent_rates_list,
             "last_state_change": state.last_state_change,
             "flap_count": state.flap_count,
+            "counter_resets": state.counter_resets,
+            "baseline_restarts": state.baseline_restarts,
             "health": asdict(state.health),
         }
 
@@ -1347,11 +1380,11 @@ class MonitorState:
             self.events_total += 1
 
     def maybe_update_baseline(self, state: InterfaceState, rates: InterfaceRates, events: List[AnomalyEvent]) -> None:
-        if rates.elapsed_us <= 0:
+        if rates.elapsed_us <= 0 or rates.counter_reset:
             return
         if self.config.policy.anomaly_freeze_baseline and events:
             return
-        state.baseline.push(rates)
+        state.baseline.push(rates, self.config.policy.baseline_window)
 
     def update(self) -> None:
         cycle_start = time.monotonic()
@@ -1372,6 +1405,19 @@ class MonitorState:
                 state.latest = sample
                 rates = RateCalculator.calculate(prev, sample)
                 state.latest_rates = rates
+                if rates.counter_reset:
+                    state.counter_resets += 1
+                    state.baseline = InterfaceBaseline()
+                    state.baseline_restarts += 1
+                    event = self.engine.maybe_emit(
+                        iface, sample.timestamp_wall, sample.timestamp_mono,
+                        "counter_reset", "counters", "warning",
+                        f"network counters reset on {iface}; statistical baseline restarted",
+                        float(state.counter_resets), 0.0, 0.0, 0.0, 1.0,
+                        ["counter_reset", "baseline_restart"],
+                    )
+                    if event is not None:
+                        self.apply_events(state, [event])
 
                 now_mono = sample.timestamp_mono
                 cutoff = now_mono - self.config.policy.flap_window_seconds
@@ -1384,7 +1430,7 @@ class MonitorState:
 
                 state.flap_count = len(state.flap_times)
 
-                if rates.elapsed_us > 0:
+                if rates.elapsed_us > 0 and not rates.counter_reset:
                     state.recent_rates.append((
                         sample.timestamp_wall,
                         rates.rx_bps,
@@ -1710,8 +1756,8 @@ def validate_port(value: int) -> int:
 
 
 def validate_interval(value: float, name: str) -> float:
-    if value <= 0:
-        raise ValueError(f"{name} must be greater than 0")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and greater than 0")
     return value
 
 
@@ -1731,6 +1777,7 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
     policy_data = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
     policy = ThresholdPolicy(
         min_baseline_samples=int(policy_data.get("min_baseline_samples", args.min_baseline_samples)),
+        baseline_window=int(policy_data.get("baseline_window", args.baseline_window)),
         spike_ratio_warn=float(policy_data.get("spike_ratio_warn", args.spike_ratio_warn)),
         spike_ratio_crit=float(policy_data.get("spike_ratio_crit", args.spike_ratio_crit)),
         drop_ratio_warn=float(policy_data.get("drop_ratio_warn", args.drop_ratio_warn)),
@@ -1748,6 +1795,18 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
         health_event_window_seconds=float(policy_data.get("health_event_window_seconds", args.health_event_window_seconds)),
         anomaly_freeze_baseline=bool(policy_data.get("anomaly_freeze_baseline", args.anomaly_freeze_baseline)),
     )
+
+    if policy.min_baseline_samples < 2:
+        raise ValueError("min_baseline_samples must be at least 2")
+    if policy.baseline_window < policy.min_baseline_samples:
+        raise ValueError("baseline_window must be at least min_baseline_samples")
+    if not all(math.isfinite(float(getattr(policy, name))) for name in (
+        "spike_ratio_warn", "spike_ratio_crit", "drop_ratio_warn", "drop_ratio_crit",
+        "zscore_warn", "zscore_crit", "error_rate_warn", "error_rate_crit",
+        "drop_rate_warn", "drop_rate_crit", "flap_window_seconds",
+        "cooldown_seconds", "health_event_window_seconds",
+    )):
+        raise ValueError("policy thresholds must be finite")
 
     include = data.get("include")
     if include is None:
@@ -1827,6 +1886,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="disable console rendering")
     parser.add_argument("--console-interval", type=float, default=2.0, help="console refresh interval")
     parser.add_argument("--min-baseline-samples", type=int, default=6)
+    parser.add_argument("--baseline-window", type=int, default=256)
     parser.add_argument("--spike-ratio-warn", type=float, default=2.5)
     parser.add_argument("--spike-ratio-crit", type=float, default=5.0)
     parser.add_argument("--drop-ratio-warn", type=float, default=0.20)
@@ -1908,6 +1968,8 @@ def main() -> int:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 1
 
+    if config.bind_host not in ("127.0.0.1", "::1", "localhost"):
+        logging.warning("HTTP API has no authentication; restrict access using firewall or a trusted reverse proxy")
     state = MonitorState(config, reader)
     worker = MonitorWorker(state)
     stop = threading.Event()
